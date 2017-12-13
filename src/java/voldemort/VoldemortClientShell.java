@@ -117,7 +117,7 @@ public class VoldemortClientShell {
         try {
             factory = new SocketStoreClientFactory(clientConfig);
             client = factory.getStoreClient(storeName);
-            adminClient = new AdminClient(clientConfig);
+            adminClient = new AdminClient(clientConfig.setIdentifierString("admin"));
 
             storeDef = StoreUtils.getStoreDef(factory.getStoreDefs(), storeName);
 
@@ -569,8 +569,10 @@ public class VoldemortClientShell {
         } else if(o instanceof List) {
             List<Object> l = (List<Object>) o;
             commandOutput.print("[");
-            for(Object obj: l)
+            for(Object obj: l) {
                 printObject(obj);
+                commandOutput.print(", ");
+            }
             commandOutput.print("]");
         } else if(o instanceof Map) {
             Map<Object, Object> m = (Map<Object, Object>) o;

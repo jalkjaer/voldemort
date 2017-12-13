@@ -16,7 +16,6 @@
 
 package voldemort.store.routed.action;
 
-import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
@@ -236,7 +235,7 @@ public class PerformParallelPutRequests extends
                                  * writes fail on exceeding Quota?
                                  * 
                                  */
-                                logger.warn("Received QuotaExceededException after a succesful "
+                                logger.warn("Received QuotaExceededException after a successful "
                                             + pipeline.getOperation().getSimpleName()
                                             + " call on node " + node.getId() + ", store '"
                                             + pipelineData.getStoreName() + "', master-node '"
@@ -260,8 +259,8 @@ public class PerformParallelPutRequests extends
         try {
             boolean preferredSatisfied = false;
             while(true) {
-                long ellapsedNs = System.nanoTime() - pipelineData.getStartTimeNs();
-                long remainingNs = (timeoutMs * Time.NS_PER_MS) - ellapsedNs;
+                long elapsedNs = System.nanoTime() - pipelineData.getStartTimeNs();
+                long remainingNs = (timeoutMs * Time.NS_PER_MS) - elapsedNs;
                 remainingNs = Math.max(0, remainingNs);
                 // preferred check
                 if(numResponsesGot >= preferred - 1) {
@@ -286,9 +285,9 @@ public class PerformParallelPutRequests extends
                     if(logger.isTraceEnabled()) {
                         logger.trace("PUT {key:" + key + "} tried to poll from queue. Null?: "
                                      + (response == null) + " numResponsesGot:" + numResponsesGot
-                                     + " parellelResponseToWait: " + numNodesPendingResponse
+                                     + " parallelResponseToWait: " + numNodesPendingResponse
                                      + "; preferred-1: " + (preferred - 1) + "; preferredOK: "
-                                     + preferredSatisfied + " quromOK: " + quorumSatisfied
+                                     + preferredSatisfied + " quorumOK: " + quorumSatisfied
                                      + "; zoneOK: " + zonesSatisfied);
                     }
 
@@ -315,7 +314,7 @@ public class PerformParallelPutRequests extends
 
             if(quorumSatisfied && zonesSatisfied) {
                 if(logger.isDebugEnabled()) {
-                    logger.debug("PUT {key:" + key + "} succeeded at parellel put stage");
+                    logger.debug("PUT {key:" + key + "} succeeded at parallel put stage");
                 }
                 pipelineData.getSynchronizer().disallowDelegateSlop();
                 pipeline.addEvent(completeEvent);
@@ -334,9 +333,9 @@ public class PerformParallelPutRequests extends
                                                                                    + "s required, but only "
                                                                                    + pipelineData.getSuccesses()
                                                                                    + " succeeded",
-                                                                           new ArrayList<Node>(pipelineData.getReplicationSet()),
-                                                                           new ArrayList<Node>(pipelineData.getNodes()),
-                                                                           new ArrayList<Node>(pipelineData.getFailedNodes()),
+                                                                           pipelineData.getReplicationSet(),
+                                                                           pipelineData.getNodes(),
+                                                                           pipelineData.getFailedNodes(),
                                                                            pipelineData.getFailures());
                     pipelineData.setFatalError(fatalError);
                 } else if(!zonesSatisfied) {
@@ -381,9 +380,9 @@ public class PerformParallelPutRequests extends
      */
     private void processResponse(Response<ByteArray, Object> response, Pipeline pipeline) {
         if(response == null) {
-            logger.warn("RoutingTimedout on waiting for async ops; parellelResponseToWait: "
+            logger.warn("RoutingTimedout on waiting for async ops; parallelResponseToWait: "
                         + numNodesPendingResponse + "; preferred-1: " + (preferred - 1)
-                        + "; quromOK: " + quorumSatisfied + "; zoneOK: " + zonesSatisfied);
+                        + "; quorumOK: " + quorumSatisfied + "; zoneOK: " + zonesSatisfied);
         } else {
             numNodesPendingResponse = numNodesPendingResponse - 1;
             numResponsesGot = numResponsesGot + 1;
@@ -404,7 +403,7 @@ public class PerformParallelPutRequests extends
                      * 
                      */
                     if(logger.isDebugEnabled()) {
-                        logger.debug("Received quota exceeded exception after a succesful "
+                        logger.debug("Received quota exceeded exception after a successful "
                                      + pipeline.getOperation().getSimpleName() + " call on node "
                                      + response.getNode().getId() + ", store '"
                                      + pipelineData.getStoreName() + "', master-node '"

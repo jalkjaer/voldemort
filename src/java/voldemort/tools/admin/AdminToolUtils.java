@@ -20,22 +20,25 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import voldemort.VoldemortException;
+import voldemort.client.ClientConfig;
 import voldemort.client.protocol.admin.AdminClient;
+import voldemort.client.protocol.admin.AdminClientConfig;
 import voldemort.cluster.Node;
 import voldemort.store.StoreDefinition;
 import voldemort.store.UnreachableStoreException;
 import voldemort.store.metadata.MetadataStore;
 import voldemort.store.metadata.MetadataStore.VoldemortState;
-import voldemort.store.quota.QuotaUtils;
+import voldemort.store.quota.QuotaType;
 import voldemort.store.system.SystemStoreConstants;
 import voldemort.utils.Utils;
 import voldemort.versioning.Versioned;
@@ -159,7 +162,11 @@ public class AdminToolUtils {
      * @return Newly constructed AdminClient
      */
     public static AdminClient getAdminClient(String url) {
-        return new AdminClient(url);
+        ClientConfig config = new ClientConfig().setBootstrapUrls(url)
+                                                .setConnectionTimeout(5, TimeUnit.SECONDS);
+
+        AdminClientConfig adminConfig = new AdminClientConfig().setAdminSocketTimeoutSec(5);
+        return new AdminClient(adminConfig, config);
     }
 
     /**
@@ -192,6 +199,23 @@ public class AdminToolUtils {
             storeNames.add(storeDefinition.getName());
         }
         return storeNames;
+    }
+
+    public static void validateStoreNameOnNode(AdminClient adminClient,
+                                         Integer nodeId,
+                                         List<String> storeNames) {
+
+        List<String> userStores = new ArrayList<String>();
+
+        for(String storeName: storeNames) {
+            if(!SystemStoreConstants.isSystemStore(storeName)) {
+                userStores.add(storeName);
+            }
+        }
+
+        if(userStores.size() > 0) {
+            validateUserStoreNamesOnNode(adminClient, nodeId, userStores);
+        }
     }
 
     /**
@@ -235,23 +259,18 @@ public class AdminToolUtils {
     /**
      * Utility function that fetches quota types.
      */
-    public static List<String> getQuotaTypes(List<String> quotaTypes) {
-        if(quotaTypes.size() < 1) {
+    public static List<QuotaType> getQuotaTypes(List<String> strQuotaTypes) {
+        if(strQuotaTypes.size() < 1) {
             throw new VoldemortException("Quota type not specified.");
         }
-        Set<String> validQuotaTypes = QuotaUtils.validQuotaTypes();
-        if(quotaTypes.size() == 1 && quotaTypes.get(0).equals(AdminToolUtils.QUOTATYPE_ALL)) {
-            Iterator<String> iter = validQuotaTypes.iterator();
-            quotaTypes = Lists.newArrayList();
-            while(iter.hasNext()) {
-                quotaTypes.add(iter.next());
-            }
+        List<QuotaType> quotaTypes;
+        if(strQuotaTypes.size() == 1 && strQuotaTypes.get(0).equals(AdminToolUtils.QUOTATYPE_ALL)) {
+            quotaTypes = Arrays.asList(QuotaType.values());
         } else {
-            for(String quotaType: quotaTypes) {
-                if(!validQuotaTypes.contains(quotaType)) {
-                    throw new VoldemortException("'" + quotaType + "' is not a valid quota type. " +
-                            "Specify a valid quota type from: " + validQuotaTypes);
-                }
+            quotaTypes = new ArrayList<QuotaType>();
+            for(String strQuotaType: strQuotaTypes) {
+                QuotaType type = QuotaType.valueOf(strQuotaType);
+                quotaTypes.add(type);
             }
         }
         return quotaTypes;

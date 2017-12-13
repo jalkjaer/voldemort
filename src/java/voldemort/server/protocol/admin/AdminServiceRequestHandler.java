@@ -67,9 +67,9 @@ import voldemort.store.StorageEngine;
 import voldemort.store.StoreCapabilityType;
 import voldemort.store.StoreDefinition;
 import voldemort.store.StoreDefinitionBuilder;
+import voldemort.store.StoreNotFoundException;
 import voldemort.store.StoreOperationFailureException;
 import voldemort.store.backup.NativeBackupable;
-import voldemort.store.configuration.FileBackedCachingStorageEngine;
 import voldemort.store.metadata.MetadataStore;
 import voldemort.store.mysql.MysqlStorageEngine;
 import voldemort.store.quota.QuotaType;
@@ -84,7 +84,6 @@ import voldemort.store.readonly.swapper.FailedFetchLock;
 import voldemort.store.slop.SlopStorageEngine;
 import voldemort.store.stats.StreamingStats;
 import voldemort.store.stats.StreamingStats.Operation;
-import voldemort.store.system.SystemStoreConstants;
 import voldemort.utils.ByteArray;
 import voldemort.utils.ByteUtils;
 import voldemort.utils.ClosableIterator;
@@ -1056,14 +1055,12 @@ public class AdminServiceRequestHandler implements RequestHandler {
                                                                                                             .setStatus("started");
         try {
             if(!metadataStore.getReadOnlyFetchEnabledUnlocked()) {
-                throw new ReadOnlyFetchDisabledException("Read-only fetcher is disabled in "
-                                             + metadataStore.getServerStateUnlocked()
-                                             + " state on node " + metadataStore.getNodeId());
+                throw new ReadOnlyFetchDisabledException("Pushes to this node have been disabled."
+                        + " Please reach out to the cluster admin for assistance.");
             }
             final ReadOnlyStorageEngine store = getReadOnlyStorageEngine(metadataStore,
                                                                          storeRepository,
                                                                          storeName);
-            final long currentVersion = store.getCurrentVersionId();
             final long pushVersion;
             if(request.hasPushVersion()) {
                 pushVersion = request.getPushVersion();
@@ -1092,11 +1089,7 @@ public class AdminServiceRequestHandler implements RequestHandler {
                         + storeName + " Generated version " + pushVersion);
             }
 
-            FileBackedCachingStorageEngine quotaStore = (FileBackedCachingStorageEngine)
-                    storeRepository.getStorageEngine(SystemStoreConstants.SystemStoreName.voldsys$_store_quotas.toString());
-            String quotaKey = QuotaUtils.makeQuotaKey(storeName, QuotaType.STORAGE_SPACE);
-            String diskQuotaSize = quotaStore.cacheGet(quotaKey);
-            Long diskQuotaSizeInKB = (diskQuotaSize == null) ? null : Long.parseLong(diskQuotaSize);
+            Long diskQuotaSizeInKB = QuotaUtils.getQuota(storeName, QuotaType.STORAGE_SPACE, storeRepository);
 
             ReadOnlyStoreFetchOperation operation = new ReadOnlyStoreFetchOperation(requestId,
                                                                                     metadataStore,
@@ -1109,24 +1102,39 @@ public class AdminServiceRequestHandler implements RequestHandler {
             AdminServiceRequestHandler.storeLock.lock();
 
             try {
-                boolean complete;
+                Long lastVersionGettingFetched = null;
+                Boolean isPreviousRequestComplete = null;
                 int previousRequestId = store.getFetchingRequest();
-
-                if (previousRequestId != ReadOnlyStorageEngine.NO_FETCH_IN_PROGRESS) {
-                    try {
-                        complete = asyncService.isComplete(store.getFetchingRequest(), false);
-                    } catch (VoldemortException e) {
-                        complete = true;
-                    }
-
-                    if (!complete)
-                        throw new VoldemortException("The store: " + storeName + " is currently blocked since it is fetching data " +
-                                "(existing operation request ID: " + previousRequestId + ")");
+                try {
+                    lastVersionGettingFetched = store.getLastVersionGettingFetched();
+                    isPreviousRequestComplete = asyncService.isComplete(previousRequestId, false);
+                } catch (VoldemortException e) {
+                    /** We carry on with the default values for {@link lastVersionGettingFetched} and {@link isPreviousRequestComplete} */
                 }
 
-                store.setFetchingRequest(requestId);
-                asyncService.submitOperation(requestId, operation);
-            }finally {
+                if ( // The first two conditions ensure that we found a valid previous job for this store
+                        lastVersionGettingFetched != null &&
+                        isPreviousRequestComplete != null &&
+                     // We check that this handleFetchROStore request comes with a desired store-version specified by the BnP job
+                        request.hasPushVersion() &&
+                     // The already existing job is for the same store-version as the current request wants
+                        lastVersionGettingFetched == request.getPushVersion() &&
+                     // This is just a sanity check but if there are no fetches in progress, we should already have short-circuited earlier
+                        previousRequestId != ReadOnlyStorageEngine.NO_FETCH_IN_PROGRESS) {
+                    // We have already received a request to fetch this particular store-version,
+                    // so we will return the previous one, in an idempotent manner.
+                    response.setRequestId(previousRequestId);
+                } else if (isPreviousRequestComplete == null || isPreviousRequestComplete) {
+                    // No fetch in progress for this store, and we have not already received a
+                    // fetch request for this store-version, so we submit a new one
+                    store.setFetchingRequest(requestId, pushVersion);
+                    asyncService.submitOperation(requestId, operation);
+                } else {
+                    // We are already fetching ANOTHER store-version for this store, so we will return an error
+                    throw new VoldemortException("The store: " + storeName + " is currently blocked since it is already fetching data " +
+                            "(existing operation request ID: " + previousRequestId + "). Status: " + asyncService.getStatus(previousRequestId));
+                }
+            } finally {
                 AdminServiceRequestHandler.storeLock.unlock();
             }
         } catch(VoldemortException e) {
@@ -1396,19 +1404,24 @@ public class AdminServiceRequestHandler implements RequestHandler {
         VAdminProto.UpdateMetadataResponse.Builder response = VAdminProto.UpdateMetadataResponse.newBuilder();
 
         try {
-            ByteArray requestKey = ProtoUtils.decodeBytes(request.getKey());
-            String keyString = ByteUtils.getString(requestKey.get(), "UTF-8");
+            ByteArray keyBytes = ProtoUtils.decodeBytes(request.getKey());
+            String keyString = ByteUtils.getString(keyBytes.get(), "UTF-8");
             if(MetadataStore.METADATA_KEYS.contains(keyString)) {
                 Versioned<byte[]> versionedValue = ProtoUtils.decodeVersioned(request.getVersioned());
 
                 logger.info("Updating metadata for key '" + keyString + "'");
-                ByteArray key = new ByteArray(ByteUtils.getBytes(keyString, "UTF-8"));
-                metadataStore.validate(key,
+                metadataStore.validate(keyBytes,
                                   versionedValue,
                                   null);
-                metadataStore.put(key,
+                metadataStore.put(keyBytes,
                                   versionedValue,
                                   null);
+
+                if(MetadataStore.CLUSTER_KEY.equals(keyString)) {
+                    server.handleClusterUpdate();
+                } else if(MetadataStore.NODE_ID_KEY.endsWith(keyString)) {
+                    server.refreshNodeIdFromMetadata();
+                }
                 logger.info("Successfully updated metadata for key '" + keyString + "'");
             }
         } catch(VoldemortException e) {
@@ -1499,27 +1512,22 @@ public class AdminServiceRequestHandler implements RequestHandler {
                                              "supported on this version of the Voldemort server.");
             }
 
-            /**
-             * GET can be done on any of the standard metadata keys
-             * ('cluster.xml', 'server.state', 'node.id', ...) or any of the
-             * store names.
-             */
-            if(MetadataStore.METADATA_KEYS.contains(keyString)
-               || metadataStore.isValidStore(keyString)) {
-                List<Versioned<byte[]>> versionedList = metadataStore.get(key, null);
-                int size = (versionedList.size() > 0) ? 1 : 0;
+            List<Versioned<byte[]>> versionedList = metadataStore.get(key, null);
 
-                if(size > 0) {
-                    Versioned<byte[]> versioned = versionedList.get(0);
-                    response.setVersion(ProtoUtils.encodeVersioned(versioned));
-                }
-            } else {
-                throw new VoldemortException("Metadata Key passed '" + keyString
-                                             + "' is not handled yet");
+            if(versionedList.size() > 0) {
+                Versioned<byte[]> versioned = versionedList.get(0);
+                response.setVersion(ProtoUtils.encodeVersioned(versioned));
             }
+
         } catch(VoldemortException e) {
             response.setError(ProtoUtils.encodeError(errorCodeMapper, e));
-            logger.error("handleGetMetadata failed for request(" + request.toString() + ")", e);
+            String errorMessage = "handleGetMetadata failed for request(" + request.toString() + ")";
+
+            if(e instanceof StoreNotFoundException) {
+                logger.info(errorMessage + " with " + StoreNotFoundException.class.getSimpleName());
+            } else {
+                logger.error(errorMessage, e);
+            }
         }
 
         return response.build();
@@ -1663,14 +1671,13 @@ public class AdminServiceRequestHandler implements RequestHandler {
                     try {
                         metadataStore.addStoreDefinition(def);
 
-                        /*
-                         * set quota to a default value as specified in the
-                         * server configs
-                         */
-                        adminClient.quotaMgmtOps.setQuotaForNode(def.getName(),
-                                                                 QuotaType.STORAGE_SPACE,
-                                                                 metadataStore.getNodeId(),
-                                                                 voldemortConfig.getDefaultStorageSpaceQuotaInKB());
+                        long defaultQuota = voldemortConfig.getDefaultStorageSpaceQuotaInKB();
+
+                        QuotaUtils.setQuota(def.getName(),
+                                            QuotaType.STORAGE_SPACE,
+                                            storeRepository,
+                                            metadataStore.getCluster().getNodeIds(),
+                                            defaultQuota);
                     } catch(Exception e) {
                         // rollback open store operation
                         boolean isReadOnly = ReadOnlyStorageConfiguration.TYPE_NAME.equals(def.getType());
@@ -2027,96 +2034,130 @@ public class AdminServiceRequestHandler implements RequestHandler {
         AdminClient adminClient = AdminClient.createTempAdminClient(voldemortConfig,
                                                                     metadataStore.getCluster(),
                                                                     1);
+        try {
+            // Get replica.factor for current store
+            StoreDefinition storeDef = adminClient.metadataMgmtOps.getStoreDefinition(storeName);
+            if (null == storeDef) {
+                throw new StoreNotFoundException(storeName);
+            }
+            int replicaFactor = storeDef.getReplicationFactor();
 
-        int maxNodeFailure = voldemortConfig.getHighAvailabilityPushMaxNodeFailures();
-        Set<Integer> nodesFailedInThisFetch = Sets.newHashSet(handleFetchFailure.getFailedNodesList());
-        int failureCount = nodesFailedInThisFetch.size();
-        boolean swapIsPossible = false;
-        String responseMessage = "";
-        if (failureCount > maxNodeFailure) {
-            // Too many nodes failed to tolerate this strategy... let's bail out.
-            responseMessage = "We cannot use pushHighAvailability because there is more than " + maxNodeFailure +
-                    " nodes that failed their fetches...";
-            logger.error(responseMessage);
-        } else {
-            FailedFetchLock distributedLock = null;
-            try {
-                Class<? extends FailedFetchLock> failedFetchLockClass =
-                        (Class<? extends FailedFetchLock>) Class.forName(voldemortConfig.getHighAvailabilityPushLockImplementation());
+            int maxNodeFailure = voldemortConfig.getHighAvailabilityPushMaxNodeFailures();
+            // Considering replicaFactor could be smaller than maxNodeFailure configured in cluster level,
+            // we need to compare the node failure number with the smaller number of (RF - 1, maxNodeFailure)
+            // to make sure there is at least one replica running.
+            maxNodeFailure = Math.min(maxNodeFailure, replicaFactor - 1);
+            Set<Integer> nodesFailedInThisFetch = Sets.newHashSet(handleFetchFailure.getFailedNodesList());
+            int failureCount = nodesFailedInThisFetch.size();
+            boolean swapIsPossible = false;
+            String responseMessage = "";
+            if (failureCount > maxNodeFailure) {
+                // Too many nodes failed to tolerate this strategy... let's bail out.
+                responseMessage = "We cannot use pushHighAvailability because there is more than " + maxNodeFailure +
+                    " nodes that failed their fetches and build.replica.factor is " + replicaFactor + "...";
+                logger.error(responseMessage);
+            } else {
+                FailedFetchLock distributedLock = null;
+                try {
+                    distributedLock = FailedFetchLock.getLock(voldemortConfig, new Props(extraInfoProperties));
 
-                Props props = new Props(extraInfoProperties);
+                    distributedLock.acquireLock();
 
-                // Pass both server properties and the remote job's properties to the FailedFetchLock constructor
-                Object[] failedFetchLockParams = new Object[]{voldemortConfig, props};
+                    Set<Integer> alreadyDisabledNodes = distributedLock.getDisabledNodes();
 
-                distributedLock = ReflectUtils.callConstructor(failedFetchLockClass, failedFetchLockParams);
+                    Set<Integer> allNodesToBeDisabled = Sets.newHashSet();
+                    allNodesToBeDisabled.addAll(alreadyDisabledNodes);
+                    allNodesToBeDisabled.addAll(nodesFailedInThisFetch);
+                    int disabledNodeSize = allNodesToBeDisabled.size();
 
-                distributedLock.acquireLock();
-
-                Set<Integer> alreadyDisabledNodes = distributedLock.getDisabledNodes();
-
-                Set<Integer> allNodesToBeDisabled = Sets.newHashSet();
-                allNodesToBeDisabled.addAll(alreadyDisabledNodes);
-                allNodesToBeDisabled.addAll(nodesFailedInThisFetch);
-
-                if (allNodesToBeDisabled.size() > maxNodeFailure) {
-                    // Too many exceptions to tolerate this strategy... let's bail out.
-                    responseMessage = "We cannot use pushHighAvailability because it would bring the total number of " +
-                                         "nodes with disabled stores to more than " + maxNodeFailure + "...";
-                    logger.error(responseMessage);
-                } else {
-                    String nodesString = "node";
-                    if (nodesFailedInThisFetch.size() > 1) {
-                        // Good grammar is important son
-                        nodesString += "s";
-                    }
-                    nodesString += " [";
-                    boolean firstNode = true;
-                    for (Integer nodeId: nodesFailedInThisFetch) {
-                        logger.warn("Will disable store '" + storeName + "' on node " + nodeId);
-                        distributedLock.addDisabledNode(nodeId, storeName, pushVersion);
-                        if (firstNode) {
-                            firstNode = false;
-                        } else {
-                            nodesString += ", ";
+                    if (disabledNodeSize > maxNodeFailure) {
+                        // Too many exceptions to tolerate this strategy... let's bail out.
+                        StringBuilder stringBuilder = new StringBuilder();
+                        stringBuilder.append("We cannot use pushHighAvailability because it would bring the total ");
+                        stringBuilder.append("number of nodes with disabled stores to more than ");
+                        stringBuilder.append(maxNodeFailure);
+                        stringBuilder.append("... alreadyDisabledNodes: [");
+                        boolean firstItem = true;
+                        for (Integer nodeId : alreadyDisabledNodes) {
+                            if (firstItem) {
+                                firstItem = false;
+                            } else {
+                                stringBuilder.append(", ");
+                            }
+                            stringBuilder.append(nodeId);
                         }
-                        nodesString += nodeId;
-                        response.addDisableStoreResponses(
+                        stringBuilder.append("], nodesFailedInThisFetch: [");
+                        firstItem = true;
+                        for (Integer nodeId : nodesFailedInThisFetch) {
+                            if (firstItem) {
+                                firstItem = false;
+                            } else {
+                                stringBuilder.append(", ");
+                            }
+                            stringBuilder.append(nodeId);
+                        }
+                        stringBuilder.append("]");
+                        stringBuilder.append(", and build.replica.factor is ")
+                            .append(replicaFactor);
+                        responseMessage = stringBuilder.toString();
+                        logger.error(responseMessage);
+                    } else {
+                        String nodesString = "node";
+                        if (nodesFailedInThisFetch.size() > 1) {
+                            // Good grammar is important son
+                            nodesString += "s";
+                        }
+                        nodesString += " [";
+                        boolean firstNode = true;
+                        for (Integer nodeId : nodesFailedInThisFetch) {
+                            logger.warn("Will disable store '" + storeName + "' on node " + nodeId);
+                            distributedLock.addDisabledNode(nodeId, storeName, pushVersion);
+                            logger.warn("Store '" + storeName + "' is disabled on node " + nodeId);
+                            if (firstNode) {
+                                firstNode = false;
+                            } else {
+                                nodesString += ", ";
+                            }
+                            nodesString += nodeId;
+                            response.addDisableStoreResponses(
                                 adminClient.readonlyOps.disableStoreVersion(nodeId, storeName, pushVersion, extraInfo));
+                        }
+                        nodesString += "]";
+                        swapIsPossible = true;
+                        responseMessage = "Swap will be possible even though " + nodesString + " failed to fetch.";
+                        logger.info(responseMessage);
                     }
-                    nodesString += "]";
-                    swapIsPossible = true;
-                    responseMessage = "Swap will be possible even though " + nodesString + " failed to fetch.";
-                    logger.info(responseMessage);
-                }
-            } catch (ClassNotFoundException e) {
-                String logMessage = "Failed to find requested FailedFetchLock implementation while setting up pushHighAvailability. ";
-                logger.error(responseMessage, e);
-                responseMessage = logMessage + "\n" + ExceptionUtils.stackTraceToString(e);
-            } catch (Exception e) {
-                String logMessage = "Got exception while trying to execute pushHighAvailability. ";
-                logger.error(responseMessage, e);
-                responseMessage = logMessage + "\n" + ExceptionUtils.stackTraceToString(e);
-            } finally {
-                if (distributedLock != null) {
-                    try {
-                        distributedLock.releaseLock();
-                    } catch (Exception e) {
-                        logger.error("Error while trying to release the shared lock used for pushHighAvailability!", e);
-                    } finally {
+                } catch (ClassNotFoundException e) {
+                    String logMessage = "Failed to find requested FailedFetchLock implementation while setting up pushHighAvailability. ";
+                    logger.error(responseMessage, e);
+                    responseMessage = logMessage + "\n" + ExceptionUtils.stackTraceToString(e);
+                } catch (Exception e) {
+                    String logMessage = "Got exception while trying to execute pushHighAvailability. ";
+                    logger.error(responseMessage, e);
+                    responseMessage = logMessage + "\n" + ExceptionUtils.stackTraceToString(e);
+                } finally {
+                    if (distributedLock != null) {
                         try {
-                            distributedLock.close();
-                        } catch (Exception inception) {
-                            logger.error("Error while trying to close the shared lock used for pushHighAvailability!",
-                                         inception);
+                            distributedLock.releaseLock();
+                        } catch (Exception e) {
+                            logger.error("Error while trying to release the shared lock used for pushHighAvailability!", e);
+                        } finally {
+                            try {
+                                distributedLock.close();
+                            } catch (Exception inception) {
+                                logger.error("Error while trying to close the shared lock used for pushHighAvailability!",
+                                    inception);
+                            }
                         }
                     }
                 }
             }
-        }
 
-        response.setSwapIsPossible(swapIsPossible);
-        response.setInfo(responseMessage);
+            response.setSwapIsPossible(swapIsPossible);
+            response.setInfo(responseMessage);
+        } finally {
+            adminClient.close();
+        }
 
         return response.build();
     }

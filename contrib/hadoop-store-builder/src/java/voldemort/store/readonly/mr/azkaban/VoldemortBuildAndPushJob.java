@@ -41,14 +41,17 @@ import java.util.concurrent.TimeUnit;
 import org.apache.avro.Schema;
 import org.apache.avro.mapred.AvroInputFormat;
 import org.apache.commons.lang.Validate;
+import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.mapred.InputFormat;
 import org.apache.hadoop.mapred.JobConf;
 import org.apache.log4j.Logger;
 
 import voldemort.VoldemortException;
+import voldemort.client.BootstrapFailureException;
 import voldemort.client.ClientConfig;
 import voldemort.client.protocol.admin.AdminClient;
+import voldemort.client.protocol.admin.AdminClientConfig;
 import voldemort.client.protocol.pb.VAdminProto;
 import voldemort.cluster.Cluster;
 import voldemort.cluster.Node;
@@ -58,9 +61,11 @@ import voldemort.store.StoreDefinition;
 import voldemort.store.UnreachableStoreException;
 import voldemort.store.readonly.checksum.CheckSum;
 import voldemort.store.readonly.checksum.CheckSum.CheckSumType;
+import voldemort.store.readonly.disk.HadoopStoreWriter;
 import voldemort.store.readonly.disk.KeyValueWriter;
 import voldemort.store.readonly.hooks.BuildAndPushHook;
 import voldemort.store.readonly.hooks.BuildAndPushStatus;
+import voldemort.store.readonly.mr.AbstractStoreBuilderConfigurable;
 import voldemort.store.readonly.mr.AvroStoreBuilderMapper;
 import voldemort.store.readonly.mr.HadoopStoreBuilder;
 import voldemort.store.readonly.mr.JsonStoreBuilderMapper;
@@ -73,6 +78,7 @@ import voldemort.store.readonly.swapper.DeleteAllFailedFetchStrategy;
 import voldemort.store.readonly.swapper.DisableStoreOnFailedNodeFailedFetchStrategy;
 import voldemort.store.readonly.swapper.FailedFetchStrategy;
 import voldemort.store.readonly.swapper.RecoverableFailedFetchException;
+import voldemort.utils.ExceptionUtils;
 import voldemort.utils.Props;
 import voldemort.utils.ReflectUtils;
 import voldemort.utils.Utils;
@@ -119,12 +125,20 @@ public class VoldemortBuildAndPushJob extends AbstractJob {
     public final static String PUSH_ROLLBACK = "push.rollback";
     public final static String PUSH_FORCE_SCHEMA_KEY = "push.force.schema.key";
     public final static String PUSH_FORCE_SCHEMA_VALUE = "push.force.schema.value";
+    public final static String PUSH_CDN_CLUSTER = "push.cdn.cluster";   // e.g. "tcp://v-cluster1:6666|hdfs://cdn1:9000,tcp://v-cluster2:6666|webhdfs://cdn2:50070,tcp://v-cluster3:6666|null"
+    public final static String PUSH_CDN_PREFIX = "push.cdn.prefix";     // e.g. "/jobs/VoldemortBnP"
+    public final static String PUSH_CDN_ENABLED = "push.cdn.enabled";   // e.g. "true"
+    public final static String PUSH_CDN_READ_BY_GROUP = "push.cdn.readByGroup";   // e.g. "true"
+    public final static String PUSH_CDN_READ_BY_OTHER = "push.cdn.readByOther";   // e.g. "true"
+    public final static String PUSH_CDN_WRITTEN_BY_GROUP = "push.cdn.writtenByGroup";   // e.g. "true"
+    public final static String PUSH_CDN_WRITTEN_BY_OTHER = "push.cdn.writtenByOther";   // e.g. "true"
+    public final static String PUSH_CDN_STORE_WHITELIST = "push.cdn.storeWhitelist";    // "storename1,storename2" no whitespace
     // others.optional
     public final static String KEY_SELECTION = "key.selection";
     public final static String VALUE_SELECTION = "value.selection";
-    public final static String NUM_CHUNKS = "num.chunks";
     public final static String BUILD = "build";
     public final static String PUSH = "push";
+    public final static String FETCH_ALL_STORES_XML = "fetch.all.stores.xml";
     public final static String VOLDEMORT_FETCHER_PROTOCOL = "voldemort.fetcher.protocol";
     public final static String VOLDEMORT_FETCHER_PORT = "voldemort.fetcher.port";
     public final static String AVRO_SERIALIZER_VERSIONED = "avro.serializer.versioned";
@@ -139,8 +153,12 @@ public class VoldemortBuildAndPushJob extends AbstractJob {
     public final static String MIN_NUMBER_OF_RECORDS = "min.number.of.records";
     public final static String REDUCER_OUTPUT_COMPRESS_CODEC = "reducer.output.compress.codec";
     public final static String REDUCER_OUTPUT_COMPRESS = "reducer.output.compress";
+    public final static String STORE_VERIFICATION_MAX_THREAD_NUM = "store.verification.max.thread.num";
+    public final static String ADMIN_CLIENT_CONNECTION_TIMEOUT_SEC = "admin.client.connection.timeout.sec";
+    public final static String ADMIN_CLIENT_SOCKET_TIMEOUT_SEC = "admin.client.socket.timeout.sec";
     // default
     private final static String RECOMMENDED_FETCHER_PROTOCOL = "webhdfs";
+    private final int DEFAULT_THREAD_NUM_FOR_STORE_VERIFICATION = 20;
 
     // CONFIG VALUES (and other immutable state)
     private final Props props;
@@ -166,6 +184,10 @@ public class VoldemortBuildAndPushJob extends AbstractJob {
     private final List<Closeable> closeables = Lists.newArrayList();
     private final ExecutorService executorService;
     private final boolean enableStoreCreation;
+    // Executor to do store/schema verification in parallel
+    private final int maxThreadNumForStoreVerification;
+    private ExecutorService storeVerificationExecutorService;
+    private final HashMap<String, Exception> exceptions = Maps.newHashMap();
 
     // Mutable state
     private StoreDefinition storeDef;
@@ -176,7 +198,16 @@ public class VoldemortBuildAndPushJob extends AbstractJob {
     private Map<String, VAdminProto.GetHighAvailabilitySettingsResponse> haSettingsPerCluster;
     private boolean buildPrimaryReplicasOnly;
 
-    public VoldemortBuildAndPushJob(String name, azkaban.utils.Props azkabanProps) {
+    private AdminClient createAdminClient(String url, boolean fetchAllStoresXml, int connectionTimeoutSec, int socketTimeoutSec) {
+        ClientConfig config = new ClientConfig().setBootstrapUrls(url)
+                .setConnectionTimeout(connectionTimeoutSec ,TimeUnit.SECONDS)
+                .setFetchAllStoresXmlInBootstrap(fetchAllStoresXml);
+
+        AdminClientConfig adminConfig = new AdminClientConfig().setAdminSocketTimeoutSec(socketTimeoutSec);
+        return new AdminClient(adminConfig, config);
+    }
+
+    public VoldemortBuildAndPushJob(String name, azkaban.utils.Props azkabanProps) throws Exception {
         super(name, Logger.getLogger(name));
         this.log = getLog();
 
@@ -184,21 +215,35 @@ public class VoldemortBuildAndPushJob extends AbstractJob {
         log.info("Job props:\n" + this.props.toString(true));
 
         this.storeName = props.getString(PUSH_STORE_NAME).trim();
+        final int connectionTimeoutSec = props.getInt(ADMIN_CLIENT_CONNECTION_TIMEOUT_SEC, 15);
+        final int socketTimeoutSec = props.getInt(ADMIN_CLIENT_SOCKET_TIMEOUT_SEC, 180);
         this.clusterURLs = new ArrayList<String>();
         this.dataDirs = new ArrayList<String>();
         this.adminClientPerCluster = Maps.newHashMap();
 
         String clusterUrlText = props.getString(PUSH_CLUSTER);
+        boolean fetchAllStoresXml = props.getBoolean(FETCH_ALL_STORES_XML, true);
         for(String url: Utils.COMMA_SEP.split(clusterUrlText.trim())) {
             if(url.trim().length() > 0) {
-                if (clusterURLs.contains(url))
-                    throw new VoldemortException("the URL: " + url + " is duplicated. Please check it out.");
-                this.clusterURLs.add(url);
-                AdminClient adminClient = new AdminClient(new ClientConfig().setBootstrapUrls(url)
-                                                                            .setConnectionTimeout(15,
-                                                                                                  TimeUnit.SECONDS));
-                this.adminClientPerCluster.put(url, adminClient);
-                this.closeables.add(adminClient);
+                if (clusterURLs.contains(url)) {
+                    throw new VoldemortException("the URL: " + url + " is repeated in the "+ PUSH_CLUSTER + " property ");
+                }
+                try {
+                    AdminClient adminClient = createAdminClient(url, fetchAllStoresXml, connectionTimeoutSec, socketTimeoutSec);
+                    this.clusterURLs.add(url);
+                    this.adminClientPerCluster.put(url, adminClient);
+                    this.closeables.add(adminClient);
+                } catch (Exception e) {
+                    if (ExceptionUtils.recursiveClassEquals(e, BootstrapFailureException.class)) {
+                        this.log.error("Unable to reach cluster: " + url + " ... this cluster will be skipped.", e);
+
+                        // We add the exception in the exceptions map so that the job fails after pushing to the healthy clusters
+                        exceptions.put(url, new VoldemortException(
+                            "Unable to reach cluster: " + url + " ... that cluster was not pushed to.", e));
+                    } else {
+                        throw e;
+                    }
+                }
             }
         }
 
@@ -220,7 +265,7 @@ public class VoldemortBuildAndPushJob extends AbstractJob {
 
 
         this.hdfsFetcherProtocol = props.getString(VOLDEMORT_FETCHER_PROTOCOL, RECOMMENDED_FETCHER_PROTOCOL);
-        if (this.hdfsFetcherProtocol != RECOMMENDED_FETCHER_PROTOCOL) {
+        if (!this.hdfsFetcherProtocol.equals(RECOMMENDED_FETCHER_PROTOCOL)) {
             log.warn("It is recommended to use the " + RECOMMENDED_FETCHER_PROTOCOL + " protocol only.");
         }
 
@@ -297,6 +342,16 @@ public class VoldemortBuildAndPushJob extends AbstractJob {
             requiredNumberOfThreads++;
         }
         this.executorService = Executors.newFixedThreadPool(requiredNumberOfThreads);
+
+        this.maxThreadNumForStoreVerification = props.getInt(STORE_VERIFICATION_MAX_THREAD_NUM,
+            DEFAULT_THREAD_NUM_FOR_STORE_VERIFICATION);
+        // Specifying value <= 1 for prop: STORE_VERIFICATION_MAX_THREAD_NUM will enable sequential store verification.
+        if (this.maxThreadNumForStoreVerification > 1) {
+            this.storeVerificationExecutorService = Executors.newFixedThreadPool(this.maxThreadNumForStoreVerification);
+            log.info("Build and Push Job will run store verification in parallel, thread num: " + this.maxThreadNumForStoreVerification);
+        } else {
+            log.info("Build and Push Job will run store verification sequentially.");
+        }
 
         log.info("Build and Push Job constructed for " + numberOfClusters + " cluster(s).");
     }
@@ -550,7 +605,6 @@ public class VoldemortBuildAndPushJob extends AbstractJob {
             }
 
             // Create a hashmap to capture exception per url
-            HashMap<String, Exception> exceptions = Maps.newHashMap();
             String buildOutputDir = null;
             Map<String, Future<Boolean>> tasks = Maps.newHashMap();
             for (int index = 0; index < clusterURLs.size(); index++) {
@@ -590,6 +644,11 @@ public class VoldemortBuildAndPushJob extends AbstractJob {
                     }
                     tasks.put(url, executorService.submit(new StorePushTask(props, url, buildOutputDir)));
                 }
+            }
+            // We can safely shutdown storeVerificationExecutorService here since all the verifications are done.
+            if (null != storeVerificationExecutorService) {
+                storeVerificationExecutorService.shutdownNow();
+                storeVerificationExecutorService = null;
             }
 
             for (Map.Entry<String, Future<Boolean>> task: tasks.entrySet()) {
@@ -663,6 +722,9 @@ public class VoldemortBuildAndPushJob extends AbstractJob {
             }
         }
         this.executorService.shutdownNow();
+        if (null != this.storeVerificationExecutorService) {
+            this.storeVerificationExecutorService.shutdownNow();
+        }
     }
 
     public String runBuildStore(Props props, String url) throws Exception {
@@ -677,9 +739,9 @@ public class VoldemortBuildAndPushJob extends AbstractJob {
         // Only if its a avro job we supply some additional fields
         // for the key value schema of the avro record
         if(this.isAvroJob) {
-            configuration.set("avro.rec.schema", getRecordSchema());
-            configuration.set("avro.key.schema", getKeySchema());
-            configuration.set("avro.val.schema", getValueSchema());
+            configuration.set(HadoopStoreBuilder.AVRO_REC_SCHEMA, getRecordSchema());
+            configuration.set(AvroStoreBuilderMapper.AVRO_KEY_SCHEMA, getKeySchema());
+            configuration.set(AvroStoreBuilderMapper.AVRO_VALUE_SCHEMA, getValueSchema());
             configuration.set(VoldemortBuildAndPushJob.AVRO_KEY_FIELD, this.keyFieldName);
             configuration.set(VoldemortBuildAndPushJob.AVRO_VALUE_FIELD, this.valueFieldName);
             mapperClass = AvroStoreBuilderMapper.class;
@@ -687,6 +749,11 @@ public class VoldemortBuildAndPushJob extends AbstractJob {
         } else {
             mapperClass = JsonStoreBuilderMapper.class;
             inputFormatClass = JsonSequenceFileInputFormat.class;
+        }
+
+        if (props.containsKey(AbstractStoreBuilderConfigurable.NUM_CHUNKS)) {
+            log.warn("N.B.: The '" + AbstractStoreBuilderConfigurable.NUM_CHUNKS + "' config parameter is now " +
+                     "deprecated and ignored. The BnP job will automatically determine a proper value for this setting.");
         }
 
         HadoopStoreBuilder builder = new HadoopStoreBuilder(getId() + "-build-store",
@@ -702,8 +769,8 @@ public class VoldemortBuildAndPushJob extends AbstractJob {
                                                             checkSumType,
                                                             props.getBoolean(SAVE_KEYS, true),
                                                             props.getBoolean(REDUCER_PER_BUCKET, true),
-                                                            props.getInt(BUILD_CHUNK_SIZE, 1024 * 1024 * 1024),
-                                                            props.getInt(NUM_CHUNKS, -1),
+                                                            props.getInt(BUILD_CHUNK_SIZE,
+                                                                (int) HadoopStoreWriter.DEFAULT_CHUNK_SIZE),
                                                             this.isAvroJob,
                                                             this.minNumberOfRecords,
                                                             this.buildPrimaryReplicasOnly);
@@ -758,6 +825,29 @@ public class VoldemortBuildAndPushJob extends AbstractJob {
 
         log.info("Push starting for cluster: " + url);
 
+        // CDN distcp
+        boolean cdnEnabled = props.getBoolean(PUSH_CDN_ENABLED, false);
+        String modifiedDataDir = new Path(dataDir).makeQualified(FileSystem.get(new JobConf())).toString();
+        List storeWhitelist = props.getList(PUSH_CDN_STORE_WHITELIST, null);
+        GobblinDistcpJob distcpJob = null;
+
+        if (cdnEnabled && storeWhitelist != null && storeWhitelist.contains(storeName)) {
+            try {
+                if (modifiedDataDir.matches(".*hdfs://.*:[0-9]{1,5}/.*")) {
+                    invokeHooks(BuildAndPushStatus.DISTCP_STARTING, url);
+                    distcpJob = new GobblinDistcpJob(getId(), modifiedDataDir, url, props);
+                    distcpJob.run();
+                    modifiedDataDir = distcpJob.getSource();
+                    invokeHooks(BuildAndPushStatus.DISTCP_FINISHED, url);
+                } else {
+                    warn("Invalid URL format! Skip Distcp.");
+                    throw new RuntimeException("Invalid URL format! Skip Distcp.");
+                }
+            } catch (Exception e) {
+                invokeHooks(BuildAndPushStatus.DISTCP_FAILED, url + " : " + e.getMessage());
+            }
+        }
+
         new VoldemortSwapJob(
                 this.getId() + "-push-store",
                 cluster,
@@ -772,7 +862,13 @@ public class VoldemortBuildAndPushJob extends AbstractJob {
                 maxNodeFailures,
                 failedFetchStrategyList,
                 url,
+                modifiedDataDir,
                 buildPrimaryReplicasOnly).run();
+
+        if (distcpJob != null) {
+            // This would allow temp dirs marked by deleteDirOnExit() to be deleted.
+            distcpJob.closeCdnFS();
+        }
     }
 
     /**
@@ -934,8 +1030,10 @@ public class VoldemortBuildAndPushJob extends AbstractJob {
         StoreDefinition newStoreDef = VoldemortUtils.getStoreDef(newStoreDefXml);
 
         try {
-            adminClientPerCluster.get(clusterURL).storeMgmtOps.verifyOrAddStore(newStoreDef, "BnP config/data", enableStoreCreation);
+            adminClientPerCluster.get(clusterURL).storeMgmtOps.verifyOrAddStore(newStoreDef, "BnP config/data",
+                enableStoreCreation, this.storeVerificationExecutorService);
         } catch (UnreachableStoreException e) {
+            log.info("verifyOrAddStore() failed on some nodes for clusterURL: " + clusterURL + " (this is harmless).", e);
             // When we can't reach some node, we just skip it and won't create the store on it.
             // Next time BnP is run while the node is up, it will get the store created.
         } // Other exceptions need to bubble up!

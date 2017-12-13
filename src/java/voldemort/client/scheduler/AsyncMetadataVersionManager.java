@@ -95,7 +95,7 @@ public class AsyncMetadataVersionManager implements Runnable {
     public Long getCurrentVersion(String versionKey, Properties versionProps) {
         Long versionValue = null;
 
-        if(versionProps.getProperty(versionKey) != null) {
+        if (versionProps != null && versionProps.getProperty(versionKey) != null) {
             versionValue = Long.parseLong(versionProps.getProperty(versionKey));
         }
 
@@ -129,7 +129,7 @@ public class AsyncMetadataVersionManager implements Runnable {
             }
         }
 
-        // Swallow all exceptions here (we dont want to fail the client).
+        // Swallow all exceptions here (we don't want to fail the client).
         catch(Exception e) {
             logger.debug("Could not retrieve Metadata Version. Exception : " + e);
         }

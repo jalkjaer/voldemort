@@ -18,6 +18,7 @@ package voldemort.server.socket;
 
 import static org.junit.Assert.assertEquals;
 
+import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.util.Properties;
 import java.util.Random;
@@ -102,7 +103,7 @@ public class NioStatsJmxTest {
         }
 
         // has to be 1, since we configure client with 1 connection and do
-        // atleast one operation
+        // at least one operation
         MBeanServer beanserver = ManagementFactory.getPlatformMBeanServer();
         ObjectName name = JmxUtils.createObjectName(JmxUtils.getPackageName(NioSocketService.class),
                                                     "nio-socket-server");
@@ -110,7 +111,7 @@ public class NioStatsJmxTest {
     }
 
     @After
-    public void tearDown() {
-        server.stop();
+    public void tearDown() throws IOException {
+        ServerTestUtils.stopVoldemortServer(server);
     }
 }

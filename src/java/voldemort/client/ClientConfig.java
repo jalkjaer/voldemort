@@ -51,6 +51,7 @@ public class ClientConfig {
     private volatile int maxConnectionsPerNode = 50;
     private volatile long connectionTimeoutMs = 500;
     private volatile long socketTimeoutMs = 5000;
+    private volatile long idleConnectionTimeoutMs = -1;
     private volatile boolean socketKeepAlive = false;
     private volatile int selectors = 8;
     private volatile long routingTimeoutMs = 5000;
@@ -99,6 +100,8 @@ public class ClientConfig {
     protected volatile int maximumTolerableFatalFailures = FailureDetectorConfig.DEFAULT_MAX_TOLERABLE_FATAL_FAILURES;
 
     private volatile int maxBootstrapRetries = 2;
+    private volatile boolean fetchAllStoresXmlInBootstrap = true;
+    private volatile int bootstrapRetryWaitTimeSeconds = 5;
     private volatile String clientContextName = "";
 
     /* 5 second check interval, in ms */
@@ -132,6 +135,7 @@ public class ClientConfig {
     public static final String THREAD_IDLE_MS_PROPERTY = "thread_idle_ms";
     public static final String CONNECTION_TIMEOUT_MS_PROPERTY = "connection_timeout_ms";
     public static final String SOCKET_TIMEOUT_MS_PROPERTY = "socket_timeout_ms";
+    public static final String IDLE_CONNECTION_TIMEOUT_MINUTES_PROPERTY = "idle_connection_timeout_minutes";
     public static final String SOCKET_KEEPALIVE_PROPERTY = "socket_keepalive";
     public static final String SELECTORS_PROPERTY = "selectors";
     public static final String ROUTING_TIMEOUT_MS_PROPERTY = "routing_timeout_ms";
@@ -182,6 +186,8 @@ public class ClientConfig {
     public static final String GETALL_OP_ZONE_AFFINITY = "getall_op_zone_affinity";
     public static final String GETVERSIONS_OP_ZONE_AFFINITY = "getversions_op_zone_affinity";
     public static final String IDENTIFIER_STRING_KEY = "identifier_string";
+    public static final String FETCH_ALL_STORES_XML_IN_BOOTSTRAP = "fetch_all_stores_xml_in_bootstrap";
+    public static final String BOOTSTRAP_RETRY_WAIT_TIME_SECONDS = "bootstrap_retry_wait_time_seconds";
 
     /**
      * Instantiate the client config using a properties file
@@ -233,6 +239,10 @@ public class ClientConfig {
         if(props.containsKey(CONNECTION_TIMEOUT_MS_PROPERTY))
             this.setConnectionTimeout(props.getInt(CONNECTION_TIMEOUT_MS_PROPERTY),
                                       TimeUnit.MILLISECONDS);
+
+        if (props.containsKey(IDLE_CONNECTION_TIMEOUT_MINUTES_PROPERTY))
+            this.setIdleConnectionTimeout(props.getInt(IDLE_CONNECTION_TIMEOUT_MINUTES_PROPERTY),
+                                      TimeUnit.MINUTES);
 
         if(props.containsKey(SOCKET_TIMEOUT_MS_PROPERTY))
             this.setSocketTimeout(props.getInt(SOCKET_TIMEOUT_MS_PROPERTY), TimeUnit.MILLISECONDS);
@@ -351,6 +361,14 @@ public class ClientConfig {
 
         if(props.containsKey(MAX_BOOTSTRAP_RETRIES))
             this.setMaxBootstrapRetries(props.getInt(MAX_BOOTSTRAP_RETRIES));
+        
+        if(props.containsKey(FETCH_ALL_STORES_XML_IN_BOOTSTRAP)) {
+            this.setFetchAllStoresXmlInBootstrap(props.getBoolean(FETCH_ALL_STORES_XML_IN_BOOTSTRAP));
+        }
+        
+        if (props.containsKey(BOOTSTRAP_RETRY_WAIT_TIME_SECONDS)) {
+            this.setBootstrapRetryWaitTimeSeconds(props.getInt(BOOTSTRAP_RETRY_WAIT_TIME_SECONDS));
+        }
 
         if(props.containsKey(CLIENT_CONTEXT_NAME)) {
             this.setClientContextName(props.getString(CLIENT_CONTEXT_NAME));
@@ -556,6 +574,55 @@ public class ClientConfig {
      */
     public ClientConfig setSocketTimeout(int socketTimeout, TimeUnit unit) {
         this.socketTimeoutMs = unit.toMillis(socketTimeout);
+        return this;
+    }
+
+    public long getIdleConnectionTimeout(TimeUnit unit) {
+        if (idleConnectionTimeoutMs <= 0) {
+            return idleConnectionTimeoutMs;
+        }
+        return unit.convert(idleConnectionTimeoutMs, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Set the timeout for idle connections. Voldemort client caches all
+     * connections to the Voldemort server. This setting allows the a connection
+     * to be dropped, if it is idle for more than this time.
+     * 
+     * This could be useful in the following cases 1) Voldemort client is not
+     * directly connected to the server and is connected via a proxy or
+     * firewall. The Proxy or firewall could drop the connection silently. If
+     * the connection is dropped, then client will see operations fail with a
+     * timeout. Setting this property enables the Voldemort client to tear down
+     * the connection before a firewall could drop it. 2) Voldemort server
+     * caches the connection and each connection has an associated memory cost.
+     * Setting this property on all clients, enable the clients to prune the
+     * connections and there by freeing up the server connections.
+     * 
+     * throws IllegalArgumentException if the timeout is less than 10 minutes.
+     * 
+     * Currently it can't be set below 10 minutes to avoid the racing risk of
+     * contention between connection checkout and selector trying to close it.
+     * This is intended for low throughput scenarios.
+     * 
+     * @param idleConnectionTimeout 
+     *      zero or negative number to disable the feature ( default -1) 
+     *      timeout
+     * @param unit {@link TimeUnit}
+     * @return ClientConfig object for chained set
+     * 
+     *         throws {@link IllegalArgumentException} if the timeout is greater
+     *         than 0, but less than 10 minutes.
+     */
+    public ClientConfig setIdleConnectionTimeout(long idleConnectionTimeout, TimeUnit unit) {
+        if (idleConnectionTimeout <= 0) {
+            this.idleConnectionTimeoutMs = -1;
+        } else {
+            if(unit.toMinutes(idleConnectionTimeout) < 10) {
+                throw new IllegalArgumentException("idleConnectionTimeout should be minimum of 10 minutes");
+            }
+            this.idleConnectionTimeoutMs = unit.toMillis(idleConnectionTimeout);
+        }
         return this;
     }
 
@@ -1092,6 +1159,50 @@ public class ClientConfig {
             throw new IllegalArgumentException("maxBootstrapRetries should be >= 1");
 
         this.maxBootstrapRetries = maxBootstrapRetries;
+        return this;
+    }
+    
+    public int getBootstrapRetryWaitTimeSeconds() {
+        return this.bootstrapRetryWaitTimeSeconds;
+    }
+
+    /**
+     * set the wait time in seconds after a failed bootstrap attempt to next
+     * retry
+     * 
+     * @param value
+     *            wait time in seconds
+     * @throws IllegalArgumentException
+     *             If bootstrapWaitTimeInSeconds < 1
+     */
+    public ClientConfig setBootstrapRetryWaitTimeSeconds(int bootstrapWaitTimeInSeconds) {
+        if (bootstrapWaitTimeInSeconds < 1) {
+            throw new IllegalArgumentException("bootstrap retry wait time should be >= 1");
+        }
+        this.bootstrapRetryWaitTimeSeconds = bootstrapWaitTimeInSeconds;
+        return this;
+    }
+
+    public boolean isFetchAllStoresXmlInBootstrap() {
+        return fetchAllStoresXmlInBootstrap;
+    }
+
+    /**
+     * Voldemort servers older than 1.8.1 supported only fetching all stores.xml
+     * 1.8.1 supported fetching individual stores. During bootstrap this
+     * property controls whether to fetch all stores.xml or only the particular
+     * store.
+     * 
+     * This property is defaulted to true, so that newer clients can work with
+     * older servers. If there are 100's of stores and you have servers running
+     * on 1.8.1 or above, it is better to set them to false.
+     * 
+     * @param value
+     *            true, to fetch all stores.xml false, to fetch only current
+     *            store
+     */
+    public ClientConfig setFetchAllStoresXmlInBootstrap(boolean value) {
+        this.fetchAllStoresXmlInBootstrap = value;
         return this;
     }
 

@@ -19,6 +19,8 @@ package voldemort.store.socket.clientrequest;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
+import javax.management.ObjectName;
+
 import org.apache.log4j.Level;
 import org.apache.log4j.Logger;
 
@@ -56,6 +58,7 @@ public class ClientRequestExecutorPool implements SocketStoreFactory {
     public static final Boolean DEFAULT_SOCKET_KEEP_ALIVE = false;
     public static final Boolean DEFAULT_JMX_ENABLED = false;
     public static final String DEFAULT_IDENTIFIER_STRING = "";
+    public static final long DEFAULT_IDLE_CONNECTION_TIMEOUT_MS  = -1 ; //Disabled by default.
 
     private final QueuedKeyedResourcePool<SocketDestination, ClientRequestExecutor> queuedPool;
     private final ClientRequestExecutorFactory factory;
@@ -65,10 +68,16 @@ public class ClientRequestExecutorPool implements SocketStoreFactory {
 
     private final Logger logger = Logger.getLogger(ClientRequestExecutorPool.class);
 
+    private ObjectName getAggregateMetricName() {
+        return JmxUtils.createObjectName(JmxUtils.getPackageName(this.getClass()), "aggregated"
+                + identifierString);
+    }
+
     public ClientRequestExecutorPool(int selectors,
                                      int maxConnectionsPerNode,
                                      int connectionTimeoutMs,
                                      int soTimeoutMs,
+                                     long idleConnectionTimeoutMs,
                                      int socketBufferSize,
                                      boolean socketKeepAlive,
                                      boolean jmxEnabled,
@@ -82,15 +91,14 @@ public class ClientRequestExecutorPool implements SocketStoreFactory {
         this.identifierString = identifierString;
         if(this.jmxEnabled) {
             stats = new ClientSocketStats(identifierString);
-            JmxUtils.registerMbean(new ClientSocketStatsJmx(stats),
-                                   JmxUtils.createObjectName(JmxUtils.getPackageName(this.getClass()),
-                                                             "aggregated" + identifierString));
+            JmxUtils.registerMbean(new ClientSocketStatsJmx(stats), getAggregateMetricName());
         } else {
             stats = null;
         }
         this.factory = new ClientRequestExecutorFactory(selectors,
                                                         connectionTimeoutMs,
                                                         soTimeoutMs,
+                                                        idleConnectionTimeoutMs,
                                                         socketBufferSize,
                                                         socketKeepAlive,
                                                         stats,
@@ -115,6 +123,7 @@ public class ClientRequestExecutorPool implements SocketStoreFactory {
              maxConnectionsPerNode,
              connectionTimeoutMs,
              soTimeoutMs,
+             DEFAULT_IDLE_CONNECTION_TIMEOUT_MS,
              socketBufferSize,
              socketKeepAlive,
              DEFAULT_JMX_ENABLED,
@@ -132,6 +141,7 @@ public class ClientRequestExecutorPool implements SocketStoreFactory {
              maxConnectionsPerNode,
              connectionTimeoutMs,
              soTimeoutMs,
+             DEFAULT_IDLE_CONNECTION_TIMEOUT_MS,
              socketBufferSize,
              socketKeepAlive,
              DEFAULT_JMX_ENABLED,
@@ -147,6 +157,7 @@ public class ClientRequestExecutorPool implements SocketStoreFactory {
              maxConnectionsPerNode,
              connectionTimeoutMs,
              soTimeoutMs,
+             DEFAULT_IDLE_CONNECTION_TIMEOUT_MS,
              socketBufferSize,
              DEFAULT_SOCKET_KEEP_ALIVE,
              DEFAULT_JMX_ENABLED,
@@ -271,9 +282,7 @@ public class ClientRequestExecutorPool implements SocketStoreFactory {
         if(stats != null) {
             try {
                 if(this.jmxEnabled)
-                    JmxUtils.unregisterMbean(JmxUtils.createObjectName(JmxUtils.getPackageName(this.getClass()),
-                                                                       "aggregated"
-                                                                               + this.identifierString));
+                    JmxUtils.unregisterMbean(getAggregateMetricName());
             } catch(Exception e) {}
             stats.close();
         }

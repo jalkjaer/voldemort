@@ -53,6 +53,7 @@ import voldemort.store.StorageEngine;
 import voldemort.store.Store;
 import voldemort.store.StoreCapabilityType;
 import voldemort.store.StoreDefinition;
+import voldemort.store.StoreNotFoundException;
 import voldemort.store.StoreUtils;
 import voldemort.store.configuration.ConfigurationStorageEngine;
 import voldemort.store.memory.InMemoryStorageEngine;
@@ -154,30 +155,23 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
     private static final Logger logger = Logger.getLogger(MetadataStore.class);
 
     public MetadataStore(Store<String, String, String> innerStore,
-                         StorageEngine<String, String, String> storeDefinitionsStorageEngine,
-                         int nodeId) {
+                         StorageEngine<String, String, String> storeDefinitionsStorageEngine) {
         super(innerStore.getName());
         this.innerStore = innerStore;
         this.metadataCache = new HashMap<String, Versioned<Object>>();
         this.storeNameTolisteners = new ConcurrentHashMap<String, List<MetadataStoreListener>>();
         this.storeDefinitionsStorageEngine = storeDefinitionsStorageEngine;
         this.storeNames = new ArrayList<String>();
-
-        init(nodeId);
+        init();
     }
 
-    // This constructor is used exclusively by tests
-    public MetadataStore(Store<String, String, String> innerStore, int nodeId) {
-        super(innerStore.getName());
-        this.innerStore = innerStore;
-        this.metadataCache = new HashMap<String, Versioned<Object>>();
-        this.storeNameTolisteners = new ConcurrentHashMap<String, List<MetadataStoreListener>>();
-        this.storeNames = new ArrayList<String>();
+    public static MetadataStore createInMemoryMetadataStore(Store<String, String, String> innerStore,
+                                                            int nodeId) {
         StorageEngine<String, String, String> storesRepo = new InMemoryStorageEngine<String, String, String>("stores-repo");
 
         List<Versioned<String>> versionedStoreList = innerStore.get(STORES_KEY, "");
 
-        if(versionedStoreList != null) {
+        if(versionedStoreList != null && versionedStoreList.size() > 0) {
             String stores = versionedStoreList.get(0).getValue();
             StoreDefinitionsMapper mapper = new StoreDefinitionsMapper();
             List<StoreDefinition> storeDefinitions = mapper.readStoreList(new StringReader(stores));
@@ -186,9 +180,10 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
                 storesRepo.put(storeDef.getName(), versionedStoreValue, null);
             }
         }
-        this.storeDefinitionsStorageEngine = storesRepo;
 
-        init(nodeId);
+        MetadataStore store = new MetadataStore(innerStore, storesRepo);
+        store.initNodeId(nodeId);
+        return store;
     }
 
     public void addMetadataStoreListener(String storeName, MetadataStoreListener listener) {
@@ -207,7 +202,7 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
         this.storeNameTolisteners.remove(storeName);
     }
 
-    public static MetadataStore readFromDirectory(File dir, int nodeId) {
+    public static MetadataStore readFromDirectory(File dir) {
         if(!Utils.isReadableDir(dir))
             throw new IllegalArgumentException("Metadata directory " + dir.getAbsolutePath()
                                                + " does not exist or can not be read.");
@@ -262,7 +257,7 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
 
         Store<String, String, String> innerStore = new ConfigurationStorageEngine(MetadataStore.METADATA_STORE_NAME,
                                                                                   dir.getAbsolutePath());
-        MetadataStore store = new MetadataStore(innerStore, storesEngine, nodeId);
+        MetadataStore store = new MetadataStore(innerStore, storesEngine);
         ServerState state = new ServerState(store);
         JmxUtils.registerMbean(state.getClass().getCanonicalName(), state);
         return store;
@@ -387,6 +382,8 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
                 // do special stuff if needed
                 if(CLUSTER_KEY.equals(key)) {
                     updateRoutingStrategies((Cluster) value.getValue(), getStoreDefList());
+                } else if(NODE_ID_KEY.equals(key)) {
+                    initNodeId(getNodeIdNoLock());
                 } else if(SYSTEM_STORES_KEY.equals(key))
                     throw new VoldemortException("Cannot overwrite system store definitions");
 
@@ -421,6 +418,8 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
 
             // Check for backwards compatibility
             StoreDefinitionUtils.validateSchemasAsNeeded(storeDefinitions);
+
+            StoreDefinitionUtils.validateNewStoreDefsAreNonBreaking(getStoreDefList(), storeDefinitions);
 
             // Go through each store definition and do a corresponding put
             for(StoreDefinition storeDef: storeDefinitions) {
@@ -531,31 +530,40 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
             String key = ByteUtils.getString(keyBytes.get(), "UTF-8");
 
             if(METADATA_KEYS.contains(key) || this.storeNames.contains(key)) {
-                List<Versioned<byte[]>> values = Lists.newArrayList();
+                try {
+                    List<Versioned<byte[]>> values = Lists.newArrayList();
 
-                // Get the cached value and convert to string
-                Versioned<String> value = convertObjectToString(key, metadataCache.get(key));
+                    // Get the cached value and convert to string
+                    Versioned<String> value = convertObjectToString(key, metadataCache.get(key));
 
-                // Metadata debugging information
-                if(logger.isTraceEnabled())
-                    logger.trace("Key " + key + " requested, returning: " + value.getValue());
+                    // Metadata debugging information
+                    if(logger.isTraceEnabled())
+                        logger.trace("Key " + key + " requested, returning: " + value.getValue());
 
-                values.add(new Versioned<byte[]>(ByteUtils.getBytes(value.getValue(), "UTF-8"),
-                                                 value.getVersion()));
+                    values.add(new Versioned<byte[]>(ByteUtils.getBytes(value.getValue(), "UTF-8"),
+                                                     value.getVersion()));
 
-                return values;
+                    return values;
+                } catch(Exception e) {
+                    throw new VoldemortException("Failed to read metadata key:"
+                                                         + ByteUtils.getString(keyBytes.get(),
+                                                                               "UTF-8")
+                                                         + " delete config/.temp config/.version directories and restart.",
+                                                 e);
+                }
             } else {
-                throw new VoldemortException("Unhandled Key:" + key + " for MetadataStore get()");
+               // This exception can be thrown in two cases.
+               // 1. An operator running vadmin.sh meta get <key> mistype the <key>
+               // 2. Client doing getStoreClient passed in a store name that does not exist
+               // Since there is no way to tell the difference between 1&2, the error message
+               // is focused on use case 2. In the future, if that is a problem the error message
+               // can be made to reflect both the cases.
+                throw new StoreNotFoundException("Store " + key + " does not exist on node "
+                                             + this.getNodeId());
             }
-        } catch(Exception e) {
-            throw new VoldemortException("Failed to read metadata key:"
-                                                 + ByteUtils.getString(keyBytes.get(), "UTF-8")
-                                                 + " delete config/.temp config/.version directories and restart.",
-                                         e);
         } finally {
             readLock.unlock();
         }
-
     }
 
     public List<Versioned<byte[]>> get(String key, String transforms) throws VoldemortException {
@@ -580,7 +588,8 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
                                       getVersions(new ByteArray(ByteUtils.getBytes(key, "UTF-8"))).get(0));
             }
 
-            init(getNodeId());
+            init();
+            initNodeId(getNodeId());
         } finally {
             writeLock.unlock();
         }
@@ -636,11 +645,15 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
         }
     }
 
+    private int getNodeIdNoLock() {
+        return (Integer) (metadataCache.get(NODE_ID_KEY).getValue());
+    }
+
     public int getNodeId() {
         // acquire read lock
         readLock.lock();
         try {
-            return (Integer) (metadataCache.get(NODE_ID_KEY).getValue());
+            return getNodeIdNoLock();
         } finally {
             readLock.unlock();
         }
@@ -978,7 +991,8 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
                     initCache(PARTITION_STREAMING_ENABLED_KEY);
                     put(READONLY_FETCH_ENABLED_KEY, true);
                     initCache(READONLY_FETCH_ENABLED_KEY);
-                    init(getNodeId());
+                    init();
+                    initNodeId(getNodeIdNoLock());
                 } else {
                     logger.error("Cannot enter NORMAL_SERVER state from " + currentState);
                     throw new VoldemortException("Cannot enter NORMAL_SERVER state from "
@@ -1137,13 +1151,45 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
         }
     }
 
+    public void initNodeId(int nodeId) {
+        writeLock.lock();
+        try {
+            initCache(NODE_ID_KEY, nodeId);
+            if(getNodeIdNoLock() != nodeId)
+                throw new RuntimeException("Attempt to start previous node:"
+                                           + getNodeId()
+                                           + " as node:"
+                                           + nodeId
+                                           + " (Did you copy config directory ? try deleting .temp .version in config dir to force clean) aborting ...");
+            // set transient values
+            updateRoutingStrategies(getCluster(), getStoreDefList());
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    public static StoreDefinition getStoreDef(String storeName, MetadataStore metadataStore) {
+        StoreDefinition def = null;
+        if(SystemStoreConstants.isSystemStore(storeName)) {
+            def = SystemStoreConstants.getSystemStoreDef(storeName);
+        } else {
+            def = metadataStore.getStoreDef(storeName);
+        }
+
+        if(def == null) {
+            throw new StoreNotFoundException("Store" + storeName + " does not exist");
+        }
+        return def;
+    }
+
     /**
      * Initializes the metadataCache for MetadataStore
      */
-    private void init(int nodeId) {
+    private void init() {
         logger.info("metadata init().");
 
         writeLock.lock();
+        try {
         // Required keys
         initCache(CLUSTER_KEY);
 
@@ -1159,14 +1205,6 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
         initSystemCache();
         initSystemRoutingStrategies(getCluster());
 
-        initCache(NODE_ID_KEY, nodeId);
-        if(getNodeId() != nodeId)
-            throw new RuntimeException("Attempt to start previous node:"
-                                       + getNodeId()
-                                       + " as node:"
-                                       + nodeId
-                                       + " (Did you copy config directory ? try deleting .temp .version in config dir to force clean) aborting ...");
-
         // Initialize with default if not present
         initCache(SLOP_STREAMING_ENABLED_KEY, true);
         initCache(PARTITION_STREAMING_ENABLED_KEY, true);
@@ -1177,10 +1215,10 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
         initCache(REBALANCING_SOURCE_CLUSTER_XML, null);
         initCache(REBALANCING_SOURCE_STORES_XML, null);
 
-        // set transient values
-        updateRoutingStrategies(getCluster(), getStoreDefList());
 
-        writeLock.unlock();
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     /**

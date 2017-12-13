@@ -129,18 +129,17 @@ public class QuotaLimitingStoreTest {
     }
 
     private void setQuota(int throughPut) {
-        String throughPutStr = Integer.toString(throughPut);
         adminClient.quotaMgmtOps.setQuota("test",
-                                          QuotaType.GET_THROUGHPUT.toString(),
-                                          throughPutStr);
+                                          QuotaType.GET_THROUGHPUT,
+                                          throughPut);
         adminClient.quotaMgmtOps.setQuota("test",
-                                          QuotaType.PUT_THROUGHPUT.toString(),
-                                          throughPutStr);
+                                          QuotaType.PUT_THROUGHPUT,
+                                          throughPut);
     }
 
     private void unSetQuota() {
-        adminClient.quotaMgmtOps.unsetQuota("test", QuotaType.GET_THROUGHPUT.toString());
-        adminClient.quotaMgmtOps.unsetQuota("test", QuotaType.PUT_THROUGHPUT.toString());
+        adminClient.quotaMgmtOps.unsetQuota("test", QuotaType.GET_THROUGHPUT);
+        adminClient.quotaMgmtOps.unsetQuota("test", QuotaType.PUT_THROUGHPUT);
     }
 
     private void enableQuotaEnforcing() {
@@ -230,9 +229,9 @@ public class QuotaLimitingStoreTest {
     }
 
     @After
-    public void teardown() {
+    public void teardown() throws IOException {
         adminClient.close();
-        server.stop();
+        ServerTestUtils.stopVoldemortServer(server);
 
         factory.close();
     }

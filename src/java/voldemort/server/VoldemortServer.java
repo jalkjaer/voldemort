@@ -25,8 +25,10 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 
+import org.apache.commons.io.IOUtils;
 import org.apache.log4j.Logger;
 
+import voldemort.VoldemortApplicationException;
 import voldemort.VoldemortException;
 import voldemort.annotations.jmx.JmxOperation;
 import voldemort.client.protocol.RequestFormatType;
@@ -51,9 +53,16 @@ import voldemort.server.rebalance.RebalancerService;
 import voldemort.server.socket.SocketService;
 import voldemort.server.storage.StorageService;
 import voldemort.store.DisabledStoreException;
+import voldemort.store.StorageEngine;
+import voldemort.store.StoreCapabilityType;
 import voldemort.store.configuration.ConfigurationStorageEngine;
 import voldemort.store.metadata.MetadataStore;
+import voldemort.store.readonly.ReadOnlyStorageEngine;
+import voldemort.store.readonly.StoreVersionManager;
+import voldemort.store.readonly.swapper.FailedFetchLock;
+import voldemort.utils.ByteArray;
 import voldemort.utils.JNAUtils;
+import voldemort.utils.Props;
 import voldemort.utils.SystemTime;
 import voldemort.utils.Utils;
 import voldemort.versioning.VectorClock;
@@ -77,7 +86,7 @@ public class VoldemortServer extends AbstractService {
 
     private final static int ASYNC_REQUEST_CACHE_SIZE = 64;
 
-    private final Node identityNode;
+    private Node identityNode;
     private final List<VoldemortService> basicServices;
     private final StoreRepository storeRepository;
     private final VoldemortConfig voldemortConfig;
@@ -87,37 +96,98 @@ public class VoldemortServer extends AbstractService {
     private StorageService storageService;
     private JmxService jmxService;
 
-    public VoldemortServer(VoldemortConfig config) {
+    private VoldemortServer(VoldemortConfig config, MetadataStore metadataStore) {
         super(ServiceType.VOLDEMORT);
         this.voldemortConfig = config;
         this.setupSSLProvider();
+        this.metadata = metadataStore;
         this.storeRepository = new StoreRepository(config.isJmxEnabled());
-        this.metadata = MetadataStore.readFromDirectory(new File(this.voldemortConfig.getMetadataDirectory()),
-                                                        voldemortConfig.getNodeId());
-        this.identityNode = metadata.getCluster().getNodeById(voldemortConfig.getNodeId());
+        // Update the config with right node Id
+        this.refreshNodeIdFromMetadata();
+
         this.checkHostName();
+
         this.validateRestServiceConfiguration();
         this.basicServices = createBasicServices();
         createOnlineServices();
     }
 
-    /**
-     * Constructor is used exclusively by tests. I.e., this is not a code path
-     * that is exercised in production.
-     *
-     * @param config
-     * @param cluster
-     */
-    public VoldemortServer(VoldemortConfig config, Cluster cluster) {
-        super(ServiceType.VOLDEMORT);
-        this.voldemortConfig = config;
-        this.setupSSLProvider();
-        this.identityNode = cluster.getNodeById(voldemortConfig.getNodeId());
+    public static int computeNodeId(VoldemortConfig config, Cluster cluster) {
+        HostMatcher matcher = config.getNodeIdImplementation();
+        return NodeIdUtils.findNodeId(cluster, matcher);
+    }
 
-        this.checkHostName();
-        this.validateRestServiceConfiguration();
-        this.storeRepository = new StoreRepository(config.isJmxEnabled());
-        // update cluster details in metaDataStore
+    public void validateNodeId() {
+        if(voldemortConfig.getNodeId() != metadata.getNodeId()) {
+            throw new VoldemortException("Voldemort Config Node Id " + voldemortConfig.getNodeId()
+                                         + " does not match with metadata store node Id "
+                                         + metadata.getNodeId());
+        }
+        validateNodeId(voldemortConfig, metadata.getCluster());
+    }
+
+    public static void validateNodeId(VoldemortConfig config, Cluster cluster) {
+        if(config.isValidateNodeId() || config.isEnableNodeIdDetection()) {
+            HostMatcher matcher = config.getNodeIdImplementation();
+            NodeIdUtils.validateNodeId(cluster, matcher, config.getNodeId());
+        } else {
+            logger.info("Node id Validation is disabled in the config.");
+        }
+    }
+
+    public static int getNodeId(VoldemortConfig config, Cluster cluster) {
+        int configNodeId = config.getNodeId();
+        if(configNodeId >= 0) {
+            return configNodeId;
+        }
+        if(!config.isEnableNodeIdDetection()) {
+            // Node Id is missing and auto detection is disabled, error out.
+            throw new VoldemortException(VoldemortConfig.NODE_ID
+                                         + " is a required property of the Voldemort Server");
+        }
+        return computeNodeId(config, cluster);
+    }
+
+    public void refreshNodeIdFromMetadata() {
+        int nodeId = this.metadata.getNodeId();
+
+        voldemortConfig.setNodeId(nodeId);
+        validateNodeId();
+        Node oldNode = this.identityNode;
+        this.identityNode = metadata.getCluster().getNodeById(nodeId);
+        if(oldNode != null) {
+            if(oldNode.getSocketPort() != this.identityNode.getSocketPort()
+               || oldNode.getAdminPort() != this.identityNode.getAdminPort()) {
+                throw new VoldemortApplicationException("Node Id update, changes the Socket And Or Admin Port. "
+                                                        + "The Server will be in an inconsistent state, until the next restart. Old State "
+                                                        + oldNode.getStateString()
+                                                        + "New State "
+                                                        + this.identityNode.getStateString());
+                }
+        }
+    }
+
+    public void handleClusterUpdate() {
+        if(!voldemortConfig.isEnableNodeIdDetection()) {
+            logger.info("Auto detection is disabled, returning");
+            return;
+        }
+
+        int nodeId = computeNodeId(voldemortConfig, metadata.getCluster());
+        // Put reInitializes the node Id as required.
+        metadata.put(MetadataStore.NODE_ID_KEY, new Integer(nodeId));
+        refreshNodeIdFromMetadata();
+    }
+
+    private static MetadataStore createMetadataFromConfig(VoldemortConfig voldemortConfig) {
+        MetadataStore metadataStore = MetadataStore.readFromDirectory(new File(voldemortConfig.getMetadataDirectory()));
+        int nodeId = getNodeId(voldemortConfig, metadataStore.getCluster());
+        metadataStore.initNodeId(nodeId);
+        return metadataStore;
+    }
+
+    private static MetadataStore getTestMetadataStore(VoldemortConfig voldemortConfig,
+                                                      Cluster cluster) {
         ConfigurationStorageEngine metadataInnerEngine = new ConfigurationStorageEngine("metadata-config-store",
                                                                                         voldemortConfig.getMetadataDirectory());
 
@@ -130,16 +200,30 @@ public class VoldemortServer extends AbstractService {
         } else {
             version = (VectorClock) clusterXmlValue.get(0).getVersion();
         }
-        version.incrementVersion(voldemortConfig.getNodeId(), System.currentTimeMillis());
+
+        int nodeId = getNodeId(voldemortConfig, cluster);
+        version.incrementVersion(nodeId, System.currentTimeMillis());
 
         metadataInnerEngine.put(MetadataStore.CLUSTER_KEY,
                                 new Versioned<String>(new ClusterMapper().writeCluster(cluster),
                                                       version),
                                 null);
-        this.metadata = new MetadataStore(metadataInnerEngine, voldemortConfig.getNodeId());
+        return MetadataStore.createInMemoryMetadataStore(metadataInnerEngine, nodeId);
+    }
 
-        this.basicServices = createBasicServices();
-        createOnlineServices();
+    public VoldemortServer(VoldemortConfig config) {
+        this(config, createMetadataFromConfig(config));
+    }
+
+    /**
+     * Constructor is used exclusively by tests. I.e., this is not a code path
+     * that is exercised in production.
+     *
+     * @param config
+     * @param cluster
+     */
+    public VoldemortServer(VoldemortConfig config, Cluster cluster) {
+        this(config, getTestMetadataStore(config, cluster));
     }
 
     private void setupSSLProvider() {
@@ -219,8 +303,10 @@ public class VoldemortServer extends AbstractService {
         boolean isRestPortDefined = (identityNode.getRestPort() != -1) ? true : false;
         if(isRestEnabled != isRestPortDefined) {
             if(isRestEnabled) {
-                logger.error("Rest Service is enabled without defining \"rest-port\" in cluster.xml");
-                System.exit(-1);
+                String errorMessage = "Rest Service is enabled without defining \"rest-port\" in cluster.xml .  "
+                                      + this.identityNode.getStateString();
+                logger.error(errorMessage);
+                throw new VoldemortApplicationException(errorMessage);
             } else {
                 logger.warn("\"rest-port\" is defined in cluster.xml but Rest service is not enabled.");
             }
@@ -515,8 +601,86 @@ public class VoldemortServer extends AbstractService {
     }
 
     public void goOnline() {
-        getMetadataStore().setOfflineState(false);
-        createOnlineServices();
-        startOnlineServices();
+        ReadOnlyStoreStatusValidation validation = validateReadOnlyStoreStatusBeforeGoingOnline();
+
+        if (validation.readyToGoOnline) {
+            getMetadataStore().setOfflineState(false);
+            createOnlineServices();
+            startOnlineServices();
+        }
+
+        if (validation.e != null) {
+            throw new VoldemortException("Problem while going online!", validation.e);
+        }
+    }
+
+    private class ReadOnlyStoreStatusValidation {
+        /** Whether the server should go online (i.e.: it has no disabled stores) */
+        private final boolean readyToGoOnline;
+        /** Whether the admin operation should return an error (this is orthogonal to whether the server went online or not) */
+        private final Exception e;
+        ReadOnlyStoreStatusValidation(boolean readyToGoOnline, Exception e) {
+            this.readyToGoOnline = readyToGoOnline;
+            this.e = e;
+        }
+    }
+
+    private ReadOnlyStoreStatusValidation validateReadOnlyStoreStatusBeforeGoingOnline() {
+        List<StorageEngine<ByteArray, byte[], byte[]>> storageEngines =
+                storageService.getStoreRepository().getStorageEnginesByClass(ReadOnlyStorageEngine.class);
+
+        if (storageEngines.isEmpty()) {
+            logger.debug("There are no Read-Only stores on this node.");
+            return new ReadOnlyStoreStatusValidation(true, null);
+        } else {
+            List<String> storesWithDisabledVersions = Lists.newArrayList();
+            for (StorageEngine storageEngine : storageEngines) {
+                StoreVersionManager storeVersionManager = (StoreVersionManager)
+                        storageEngine.getCapability(StoreCapabilityType.DISABLE_STORE_VERSION);
+                if (storeVersionManager.hasAnyDisabledVersion()) {
+                    storesWithDisabledVersions.add(storageEngine.getName());
+                }
+            }
+
+            if (storesWithDisabledVersions.isEmpty()) {
+                if (voldemortConfig.getHighAvailabilityStateAutoCleanUp()) {
+                    logger.info(VoldemortConfig.PUSH_HA_STATE_AUTO_CLEANUP +
+                                "=true, so the server will attempt to delete the HA state for this node, if any.");
+                    FailedFetchLock failedFetchLock = null;
+                    try {
+                        failedFetchLock = FailedFetchLock.getLock(getVoldemortConfig(), new Props());
+                        failedFetchLock.removeObsoleteStateForNode(getVoldemortConfig().getNodeId());
+                        logger.info("Successfully ensured that the BnP HA shared state is cleared for this node.");
+                    } catch (ClassNotFoundException e) {
+                        return new ReadOnlyStoreStatusValidation(true, new VoldemortException("Failed to find FailedFetchLock class!", e));
+                    } catch (Exception e) {
+                        return new ReadOnlyStoreStatusValidation(true, new VoldemortException("Exception while trying to remove obsolete HA state!", e));
+                    } finally {
+                        IOUtils.closeQuietly(failedFetchLock);
+                    }
+                } else {
+                    logger.info(VoldemortConfig.PUSH_HA_STATE_AUTO_CLEANUP +
+                            "=false, so the server will NOT attempt to delete the HA state for this node, if any.");
+                }
+
+                logger.info("No Read-Only stores are disabled. Going online as planned.");
+                return new ReadOnlyStoreStatusValidation(true, null);
+            } else {
+                // OMG, there are disabled stores!
+                StringBuilder stringBuilder = new StringBuilder();
+                stringBuilder.append("Cannot go online, because the following Read-Only stores have some disabled version(s): ");
+                boolean firstItem = true;
+                for (String storeName: storesWithDisabledVersions) {
+                    if (firstItem) {
+                        firstItem = false;
+                    } else {
+                        stringBuilder.append(", ");
+                    }
+                    stringBuilder.append(storeName);
+
+                }
+                return new ReadOnlyStoreStatusValidation(false, new VoldemortException(stringBuilder.toString()));
+            }
+        }
     }
 }

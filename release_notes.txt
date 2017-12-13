@@ -1,3 +1,93 @@
+Release 1.10.26 8/30/2017
+* Improved some BnP-related logging.
+* The RO server is now returning old async op IDs idempotently.
+* Added retries for soft errors in AdminClient#waitForCompletion.
+* Fixed issue with too long commands in Windows 10 bat files.
+
+Release 1.10.25 7/26/2017
+* Updated Gobblin dependency from 0.10.0 to 0.11.0
+
+Release 1.10.24 7/21/2017
+* Added optional CDN feature to the BnP pipeline.
+* Fixed the client shell's list parsing logic.
+* Fixed a connection leakage due to unclosed adminClient.
+* Improved failure detection in HA mode.
+* Increased javac version to 1.7
+* Fixed various minor problems.
+
+Release 1.10.23 10/11/2016
+* Added some extra logging when OOM occurs in BnP.
+* Made admin connection/socket timeout configurable in BnP.
+* Changed the DeleteAllFailedFetchStrategy so that it affects all nodes.
+* BnP now kills an async job that it is waiting on if that job times out.
+* Tweaked the AdminClient's currentVersion so that it is not stale.
+* BnP now retries fetches when cluster.xml is stale.
+
+Release 1.10.22 9/20/2016
+* Fixes BnP resilience to colo failures
+* Fixes indentation issue with python client
+* Adds 'readonly.omit.port' server configuration
+* Fixes data cleanup job
+* Fixes discrepancy on data retention configuration
+
+Release 1.10.21 8/10/2016
+* Fix admin request timeout issue because HDFSFailedlock takes long time.
+* Provide chunk size suggestion for BnP jobs.
+
+Release 1.10.20 7/28/2016
+* Reduce the server log level on missing stores
+
+Release 1.10.19 7/25/2016
+* getAll Quota support
+* meaningful log message, when fetch is disabled
+* Run BnP store verification in parallel.
+* Auto Detect Node Id from Cluster.xml
+* Validate Node Id for Host Match from Cluster.xml
+* Auto update Node Id on cluster.xml update
+* Generate SSH script for running on all hosts in cluster.xml (experimental)
+* Concurrent Modification Exception on InsufficientOperationlNodes Exception
+* Log time taken in verifyOrAddStore
+* Serialize rest-port on cluster.xml
+
+Release 1.10.18 6/28/2016
+* get/set/delete quota takes QuotaType instead of string
+* Fix NPE when diffMessage is called from Build and Push
+* Missing store, gives a recognizable error message.
+* vadmin tool increased timeout
+* Logging changes for BnP
+* AdminClientPool for pooling adminClients.
+* AdminClient change to detect if cluster is modified
+* Parallel operation support for AddStore/SetQuota
+* Fetch single store for BnP Store Creation
+* Utility method to query only a single store
+* update store validates the store definition change
+
+Release 1.10.17 6/1/2016
+* Add additional debug info to client registry
+* Fix Admin Connection/Socket timeout from Bnp
+* Add idle connection timeout feature for Voldemort clients.
+* Don't use Properties(properties) constructor in Voldemort
+
+Release 1.10.16 5/23/2016
+* Lower the node connection errors log to debug level
+* Cleanup the HA state in HDFS directory during online state transition
+* Option to fetch single store in bootstrap
+* Fix Client shell reports exception on closing
+* Print more info when cluster metadata check fails
+* Route the system store to current zone only
+* Reliable way to set the quota for stores.
+* Add retry for Hdfs isFile call
+* Remove support for num.chunks in the Build and Push
+* ReplaceNode CLI test enhancement
+* Include quota check in metadata check
+* DataCleanup job picks up latest information for stores
+* Gradle task tar/zip fixes
+
+Release 1.10.15 4/18/2016
+* Set-Metadata null Version error
+* Multi module gradle build for voldemort
+* The AdminClient's verifyOrAddStore is vulnerable to connectivity issues.
+
 Release 1.10.14 3/29/2016
 * Report metrics for Scheduler and Async Service
 * better error message thrown when pushing to a store with storage quota 0
@@ -1208,7 +1298,7 @@ The following changes were made since 0.55:
 * Fixed race condition in AbstractSocketPoolTest
 * Added improved monitoring for bdb stats
 * Added backoff and retry logic in bootstrap code
-* Not logging obosleteVersionException(s) or counting it in JMX exception count
+* Not logging obsoleteVersionException(s) or counting it in JMX exception count
 * Fixed issue 159
 * C++ client building on OS X
 * Rely only on the number of versions returned to decide whether to retrieve

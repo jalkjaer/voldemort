@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.io.StringReader;
 import java.net.BindException;
 import java.net.ServerSocket;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
@@ -779,7 +780,7 @@ public class ServerTestUtils {
                        new Versioned<String>(new StoreDefinitionsMapper().writeStoreList(storeDefs)),
                        null);
 
-        return new MetadataStore(innerStore, 0);
+        return MetadataStore.createInMemoryMetadataStore(innerStore, 0);
     }
 
     public static MetadataStore createMetadataStore(Cluster cluster,
@@ -793,7 +794,7 @@ public class ServerTestUtils {
                        new Versioned<String>(new StoreDefinitionsMapper().writeStoreList(storeDefs)),
                        null);
 
-        return new MetadataStore(innerStore, nodeId);
+        return MetadataStore.createInMemoryMetadataStore(innerStore, nodeId);
     }
 
     public static List<StoreDefinition> getStoreDefs(int numStores) {
@@ -868,6 +869,12 @@ public class ServerTestUtils {
                                            .setPreferredWrites(pwrites)
                                            .setRequiredWrites(rwrites)
                                            .build();
+    }
+
+    public static File createTempFile(String prefix, String suffix) throws IOException {
+        File file = File.createTempFile(prefix, suffix);
+        file.deleteOnExit();
+        return file;
     }
 
     public static HashMap<ByteArray, byte[]> createRandomKeyValuePairs(int numKeys) {
@@ -1044,6 +1051,33 @@ public class ServerTestUtils {
         try {
             Thread.sleep(milliseconds);
         } catch(InterruptedException e) {}
+    }
+
+    private static SocketStoreFactory getSocketStoreFactory() {
+        return new ClientRequestExecutorPool(2, 10000, 100000, 32 * 1024);
+    }
+
+    public static VoldemortServer restartServer(VoldemortServer oldServer, int nodeId, Cluster cluster,
+            Properties serverProps)
+            throws Exception {
+        ServerTestUtils.stopVoldemortServer(oldServer);
+
+
+        String baseDirPath = oldServer.getVoldemortConfig().getVoldemortHome();
+        String parentDirPath = Paths.get(baseDirPath).getParent().toString();
+        List<StoreDefinition> storeDefs = oldServer.getMetadataStore().getStoreDefList();
+
+        final boolean ENABLE_NIO = true;
+        VoldemortConfig config =
+                ServerTestUtils.createServerConfigWithDefs(ENABLE_NIO, nodeId, parentDirPath, cluster, storeDefs,
+                        serverProps);
+        SocketStoreFactory socketStoreFactory = getSocketStoreFactory();
+        try {
+            return startVoldemortServer(socketStoreFactory, config, cluster);
+        } finally {
+            socketStoreFactory.close();
+        }
+
     }
 
 
@@ -1359,11 +1393,7 @@ public class ServerTestUtils {
         boolean started = false;
         Cluster cluster = null;
 
-        SocketStoreFactory socketStoreFactory = new ClientRequestExecutorPool(2,
-                                                                              10000,
-                                                                              100000,
-                                                                              32 * 1024);
-
+        SocketStoreFactory socketStoreFactory = getSocketStoreFactory();
         try {
             while(!started) {
                 try {
@@ -1393,10 +1423,7 @@ public class ServerTestUtils {
                                                 Properties serverProperties,
                                                 String storesXmlFile) throws IOException {
 
-        SocketStoreFactory socketStoreFactory = new ClientRequestExecutorPool(2,
-                                                                              10000,
-                                                                              100000,
-                                                                              32 * 1024);
+        SocketStoreFactory socketStoreFactory = getSocketStoreFactory();
         Cluster cluster = null;
         try {
             cluster = ServerTestUtils.startVoldemortCluster(servers.length,
@@ -1421,10 +1448,7 @@ public class ServerTestUtils {
         VoldemortServer[] servers = new VoldemortServer[1];
         int partitionMap[][] = { { 0, 1, 2, 3 } };
 
-        SocketStoreFactory socketStoreFactory = new ClientRequestExecutorPool(2,
-                                                                              10000,
-                                                                              100000,
-                                                                              32 * 1024);
+        SocketStoreFactory socketStoreFactory = getSocketStoreFactory();
         try {
             Cluster cluster = ServerTestUtils.startVoldemortCluster(1,
                                                                     servers,

@@ -44,8 +44,10 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -83,8 +85,10 @@ import voldemort.server.rebalance.VoldemortRebalancingException;
 import voldemort.server.storage.prunejob.VersionedPutPruneJob;
 import voldemort.server.storage.repairjob.RepairJob;
 import voldemort.store.ErrorCodeMapper;
+import voldemort.store.InvalidMetadataException;
 import voldemort.store.Store;
 import voldemort.store.StoreDefinition;
+import voldemort.store.StoreNotFoundException;
 import voldemort.store.StoreUtils;
 import voldemort.store.UnreachableStoreException;
 import voldemort.store.metadata.MetadataStore;
@@ -108,6 +112,7 @@ import voldemort.store.system.SystemStoreConstants;
 import voldemort.store.views.ViewStorageConfiguration;
 import voldemort.utils.ByteArray;
 import voldemort.utils.ByteUtils;
+import voldemort.utils.ExceptionUtils;
 import voldemort.utils.MetadataVersionStoreUtils;
 import voldemort.utils.NetworkClassLoader;
 import voldemort.utils.Pair;
@@ -145,7 +150,7 @@ import com.google.protobuf.UninitializedMessageException;
  * <li>Used extensively by rebalancing (dynamic node addition/deletion) feature
  * (presently in development).</li>
  * </ul>
- * 
+ *
  */
 public class AdminClient implements Closeable {
 
@@ -166,10 +171,12 @@ public class AdminClient implements Closeable {
     private final AdminStoreClient adminStoreClient;
     private final NetworkClassLoader networkClassLoader;
     private final AdminClientConfig adminClientConfig;
+    private final ClientConfig clientConfig;
+    private final boolean fetchSingleStore;
     private final String debugInfo;
+    private Long clusterVersion;
     private Cluster currentCluster;
     private SystemStoreClient<String, String> metadataVersionSysStoreClient = null;
-    private SystemStoreClient<String, String> quotaSysStoreClient = null;
     private SystemStoreClientFactory<String, String> systemStoreFactory = null;
 
     final public AdminClient.HelperOperations helperOps;
@@ -204,7 +211,7 @@ public class AdminClient implements Closeable {
         if(clientConfig.getBootstrapUrls().length == 0) {
             throw new IllegalArgumentException("Client config does not have valid bootstrapUrls");
         }
-        debugInfo = "AdminClient with BootStrapUrls: "
+        debugInfo = "BootStrapUrls: "
                     + Arrays.toString(clientConfig.getBootstrapUrls());
         this.helperOps = this.new HelperOperations();
         this.replicaOps = this.new ReplicationOperations();
@@ -225,18 +232,23 @@ public class AdminClient implements Closeable {
                                                                .getContextClassLoader());
 
         this.adminClientConfig = adminClientConfig;
+        this.clientConfig = clientConfig;
         this.socketPool = helperOps.createSocketPool(adminClientConfig);
         this.adminStoreClient = new AdminStoreClient(clientConfig);
+        this.fetchSingleStore = !clientConfig.isFetchAllStoresXmlInBootstrap();
 
         if(cluster != null) {
+            // We don't know at which time the Cluster's state was generated, so we can't know the cluster version.
+            this.clusterVersion = null;
             this.currentCluster = cluster;
         } else {
+            // Important: this time must be recorded before we bootstrap from the remote state
+            this.clusterVersion = System.currentTimeMillis();
             this.currentCluster = getClusterFromBootstrapURL(clientConfig);
         }
 
         Utils.notNull(this.currentCluster);
         helperOps.initSystemStoreClient(clientConfig);
-
     }
 
     public AdminClient(String bootstrapURL) {
@@ -279,20 +291,70 @@ public class AdminClient implements Closeable {
         this(adminClientConfig, clientConfig, cluster);
     }
 
+    /**
+     * This function can be useful to rebootstrap a new {@link AdminClient} when
+     * {@link #isClusterModified()} returns true.
+     *
+     * @return a freshly re-bootstrapped {@link AdminClient} based on the same configs.
+     */
+    public AdminClient getFreshClient() {
+        return new AdminClient(adminClientConfig, clientConfig);
+    }
+
     @Override
     public String toString() {
-        return debugInfo;
+        return "AdminClient with " + debugInfo;
     }
 
     /**
      * Stop the AdminClient cleanly freeing all resources.
      */
+    @Override
     public void close() {
         this.socketPool.close();
         this.adminStoreClient.close();
 
         if(systemStoreFactory != null) {
             systemStoreFactory.close();
+        }
+    }
+
+    /**
+     * If Cluster is modified ( nodes are added/removed), using the old
+     * AdminClient will cause inconsistent operations. This method returns true
+     * under such cases, so that caller can discard the current AdminClient and
+     * create new AdminClient.
+     * 
+     * @return true if cluster is modified since the AdminClient is create,
+     *         false otherwise
+     */
+    public boolean isClusterModified() {
+        try {
+            if (null == clusterVersion) {
+                // Then we have no choice to do a full cluster.xml equality check in order to know if the cluster is the same.
+
+                // Important: this time must be recorded before we bootstrap from the remote state
+                long currentTime = System.currentTimeMillis();
+
+                Cluster remoteCluster = getClusterFromBootstrapURL(clientConfig);
+
+                boolean remoteClusterConsistentWithLocalOne = currentCluster.equals(remoteCluster);
+                if (remoteClusterConsistentWithLocalOne) {
+                    // Then we can record the time we had prior to bootstrapping, as an optimization
+                    clusterVersion = currentTime;
+                }
+
+                return !remoteClusterConsistentWithLocalOne;
+            } else {
+                // Then we can rely on the timestamp we recorded before the bootstrap phase.
+                Properties props = MetadataVersionStoreUtils.getProperties(metadataVersionSysStoreClient);
+                long retrievedVersion = MetadataVersionStoreUtils.getVersion(props, SystemStoreConstants.CLUSTER_VERSION_KEY);
+
+                return retrievedVersion > this.clusterVersion;
+            }
+        } catch(Exception e) {
+            logger.info("Error retrieving cluster metadata version");
+            return true;
         }
     }
 
@@ -372,13 +434,9 @@ public class AdminClient implements Closeable {
                     systemStoreFactory = new SystemStoreClientFactory<String, String>(clientConfig);
                 }
                 String metadataVersionStoreName = SystemStoreConstants.SystemStoreName.voldsys$_metadata_version_persistence.name();
-                String quotaStoreName = SystemStoreConstants.SystemStoreName.voldsys$_store_quotas.name();
                 metadataVersionSysStoreClient = systemStoreFactory.createSystemStore(metadataVersionStoreName,
                                                                                      null,
                                                                                      null);
-                quotaSysStoreClient = systemStoreFactory.createSystemStore(quotaStoreName,
-                                                                           null,
-                                                                           null);
             } catch(Exception e) {
                 logger.info("Error while creating a system store client for metadata version store/quota store.",
                             e);
@@ -881,6 +939,10 @@ public class AdminClient implements Closeable {
             long lastStatusReportTime = -1;
             final long maxUnchangingStatusDelay = adminClientConfig.getMaxBackoffDelayMs() * 10; // 10 minutes under default settings
 
+            // State to detect soft errors (i.e.: connectivity issues)
+            int currentSoftErrors = 0;
+            final int maxSoftErrors = 30;
+
             while(System.currentTimeMillis() < waitUntil) {
                 try {
                     AsyncOperationStatus status = getAsyncRequestStatus(nodeId, requestId);
@@ -913,28 +975,44 @@ public class AdminClient implements Closeable {
                         return status.getStatus();
                     }
 
-                    if(delay < adminClientConfig.getMaxBackoffDelayMs())
-                        delay <<= 1;
-
-                    try {
-                        Thread.sleep(delay);
-                    } catch(InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
+                    currentSoftErrors = 0;
                 } catch(Exception e) {
-                    String errorMessage = "Failed while waiting for async task ("
-                            + description + ") at " + nodeName
-                            + " to finish";
-                    if(e instanceof VoldemortException) {
-                        throw (VoldemortException) e;
-                    } else {
-                        throw new VoldemortException(errorMessage, e);
+                    boolean shouldThrow = true;
+                    if (ExceptionUtils.recursiveClassEquals(e, ExceptionUtils.BNP_SOFT_ERRORS)) {
+                        currentSoftErrors++;
+                        String errorMessage = "Got a soft error trying to request AsyncOperationStatus. " +
+                                "current/max soft errors in a row: " + currentSoftErrors + "/" + maxSoftErrors;
+                        if (currentSoftErrors < maxSoftErrors) {
+                            logger.error(errorMessage + ". Will wait " + delay + " ms and try again.", e);
+                            shouldThrow = false;
+                        } else {
+                            logger.error(errorMessage + ". Will rethrow exception.", e);
+                        }
+                    }
+                    if (shouldThrow) {
+                        String errorMessage = "Failed while waiting for async task ("
+                                + description + ") at " + nodeName + " to finish";
+
+                        if (e instanceof VoldemortException) {
+                            throw (VoldemortException) e;
+                        } else {
+                            throw new VoldemortException(errorMessage, e);
+                        }
                     }
                 }
+
+                try {
+                    Thread.sleep(delay);
+                } catch(InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+
+                if(delay < adminClientConfig.getMaxBackoffDelayMs())
+                    delay <<= 1;
             }
-            throw new VoldemortException("Failed to finish task requestId: " + requestId
-                                         + " in maxWait " + maxWait + " " + timeUnit.toString()
-                                         + " on " + nodeName);
+            throw new AsyncOperationTimeoutException("Failed to finish task requestId: " + requestId
+                                                     + " in maxWait " + maxWait + " " + timeUnit.toString()
+                                                     + " on " + nodeName);
         }
 
         /**
@@ -1043,15 +1121,81 @@ public class AdminClient implements Closeable {
      * 
      */
     public class MetadataManagementOperations {
-        private Versioned<Properties> getMetadataVersion(Integer nodeId) throws Exception {
-            ByteArray keyArray;
-            keyArray = new ByteArray(SystemStoreConstants.VERSIONS_METADATA_KEY.getBytes("UTF8"));
+        private ByteArray getKeyArray() {
+            try {
+                return new ByteArray(SystemStoreConstants.VERSIONS_METADATA_KEY.getBytes("UTF8"));
+            } catch (UnsupportedEncodingException ex) {
+                throw new VoldemortApplicationException("Error retrieving metadata version store key", ex);
+            }
+        }
 
+        public Versioned<Properties> getMetadataVersion(Integer nodeId) {
+            ByteArray keyArray = getKeyArray();
             List<Versioned<byte[]>> valueObj = storeOps.getNodeKey(SystemStoreConstants.SystemStoreName.voldsys$_metadata_version_persistence.name(),
                                                                    nodeId,
                                                                    keyArray);
 
             return MetadataVersionStoreUtils.parseProperties(valueObj);
+        }
+
+        private void setMetadataVersion(int nodeId, Versioned<byte[]> value) {
+            ByteArray keyArray = getKeyArray();
+            
+            NodeValue<ByteArray, byte[]> nodeKeyValue = new NodeValue<ByteArray, byte[]>(nodeId, keyArray, value);
+            storeOps.putNodeKeyValue(SystemStoreConstants.SystemStoreName.voldsys$_metadata_version_persistence.name(),
+                                     nodeKeyValue);
+
+        }
+
+        private void setMetadataVersion(Collection<Integer> nodeIds, Versioned<Properties> props) throws Exception {
+
+            if (props == null || props.getValue() == null) {
+                return;
+            }
+
+            if (nodeIds == null || nodeIds.size() == 0) {
+                logger.warn("Ignoring set Metadata versions call due to empty nodeIds");
+                return;
+            }
+
+            Exception lastEx = null;
+            VectorClock version = (VectorClock) props.getVersion();
+            version.incrementVersion(nodeIds.iterator().next(), System.currentTimeMillis());
+            byte[] versionBytes = MetadataVersionStoreUtils.convertToByteArray(props.getValue());
+
+            Versioned<byte[]> value = new Versioned<byte[]>(versionBytes, version);
+            for (Integer nodeId : nodeIds) {
+                try {
+                    setMetadataVersion(nodeId, value);
+                } catch(InvalidMetadataException invalidEx) {
+                    // When Nodes are dropped after a cluster XML update, it
+                    // throws InvalidMetadataException on meta data version
+                    // updates
+                    logger.info("Ignoring InvalidMetadataException as the node is removed from cluster. Node: "
+                                + nodeId);
+                } catch (Exception ex) {
+                    lastEx = ex;
+                    logger.info("Error updating metadata versions on the node " + nodeId, ex);
+                }
+            }
+            
+            if(lastEx != null) {
+                throw lastEx;
+            }
+        }
+
+        /**
+         * Set the meta data versions on all nodes to the provided properties.
+         * 
+         * @param newProperties The new meta data versions to be set across all
+         *        the nodes in the cluster
+         */
+        public void setMetadataVersion(Versioned<Properties> newProperties) {
+            try {
+                setMetadataVersion(getAdminClientCluster().getNodeIds(), newProperties);
+            } catch(Exception ex) {
+                throw new VoldemortApplicationException("Error setting metadata", ex);
+            }
         }
 
         private Versioned<Properties> getMetadataVersion(Collection<Integer> nodeIds) {
@@ -1069,7 +1213,9 @@ public class AdminClient implements Closeable {
 
                     atLeastOneSuccess = true;
                 } catch(Exception e) {
-                    logger.error("Error retrieving metadata versions for node " + nodeId, e);
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("Error retrieving metadata versions for node " + nodeId, e);
+                    }
                 }
             }
             
@@ -1123,8 +1269,7 @@ public class AdminClient implements Closeable {
 
                 versionProps = new Versioned<Properties>(props, versionProps.getVersion());
 
-                MetadataVersionStoreUtils.setProperties(AdminClient.this.metadataVersionSysStoreClient,
-                                                        versionProps);
+                setMetadataVersion(nodeIds, versionProps);
             } catch(Exception ex) {
                 logger.error("Error Updating version on individual nodes falling back to old behavior ",
                              ex);
@@ -1149,27 +1294,6 @@ public class AdminClient implements Closeable {
                                                     props);
         }
 
-        /**
-         * Set the metadata versions to the given set
-         * 
-         * @param newProperties The new metadata versions to be set across all
-         *        the nodes in the cluster
-         */
-        public void setMetadataversion(Properties newProperties) {
-            MetadataVersionStoreUtils.setProperties(AdminClient.this.metadataVersionSysStoreClient,
-                                                    newProperties);
-        }
-
-        /**
-         * Set the metadata versions to the given set
-         * 
-         * @param newProperties The new metadata versions to be set across all
-         *        the nodes in the cluster
-         */
-        public void setMetadataversion(Versioned<Properties> newProperties) {
-            MetadataVersionStoreUtils.setProperties(AdminClient.this.metadataVersionSysStoreClient,
-                                                    newProperties);
-        }
 
         /**
          * Update metadata at the given remoteNodeId.
@@ -1394,6 +1518,10 @@ public class AdminClient implements Closeable {
                                              String storesKey,
                                              Versioned<String> storesValue) {
 
+            if (remoteNodeIds == null || remoteNodeIds.size() == 0) {
+                throw new IllegalArgumentException("One ore more nodes expected for NodeIds");
+            }
+
             for(Integer currentNodeId: remoteNodeIds) {
                 logger.info("Setting " + clusterKey + " and " + storesKey + " for "
                             + getAdminClientCluster().getNodeById(currentNodeId).getHost() + ":"
@@ -1406,9 +1534,10 @@ public class AdminClient implements Closeable {
             }
 
             if(clusterKey.equals(SystemStoreConstants.CLUSTER_VERSION_KEY)) {
+                // Setting cluster.xml will cause all the stores to be
+                // re-bootstrapped anyway.
                 metadataMgmtOps.updateMetadataversion(remoteNodeIds, clusterKey);
-            }
-            if(storesKey.equals(SystemStoreConstants.STORES_VERSION_KEY)) {
+            } else if (storesKey.equals(SystemStoreConstants.STORES_VERSION_KEY)) {
                 StoreDefinitionsMapper storeDefsMapper = new StoreDefinitionsMapper();
                 List<StoreDefinition> storeDefs = storeDefsMapper.readStoreList(new StringReader(storesValue.getValue()));
                 if(storeDefs != null) {
@@ -1548,6 +1677,8 @@ public class AdminClient implements Closeable {
             updateRemoteMetadata(nodeId,
                                  MetadataStore.CLUSTER_KEY,
                                  new Versioned<String>(clusterMapper.writeCluster(cluster), clock));
+
+            metadataMgmtOps.updateMetadataversion(Arrays.asList(nodeId), MetadataStore.CLUSTER_KEY);
         }
 
         /**
@@ -1580,11 +1711,15 @@ public class AdminClient implements Closeable {
             StoreDefinitionUtils.validateSchemasAsNeeded(storeDefs);
 
             for(Integer nodeId: nodeIds) {
+
+                // Ensure it doesn't break the store
+                Versioned<List<StoreDefinition>> remoteStoreDefList = metadataMgmtOps.getRemoteStoreDefList(nodeId);
+                StoreDefinitionUtils.validateNewStoreDefsAreNonBreaking(remoteStoreDefList.getValue(), storeDefs);
+
                 logger.info("Updating stores.xml for "
                             + currentCluster.getNodeById(nodeId).getHost() + ":" + nodeId);
                 // get current version.
-                VectorClock oldClock = (VectorClock) metadataMgmtOps.getRemoteStoreDefList(nodeId)
-                                                                    .getVersion();
+                VectorClock oldClock = (VectorClock) remoteStoreDefList.getVersion();
 
                 Versioned<String> value = new Versioned<String>(storeMapper.writeStoreList(storeDefs),
                                                                 oldClock.incremented(nodeId, 1));
@@ -1635,6 +1770,16 @@ public class AdminClient implements Closeable {
                 throws VoldemortException {
             updateRemoteStoreDefList(storeDefs, currentCluster.getNodeIds());
         }
+        
+        private Versioned<List<StoreDefinition>> getRemoteStoreDefList(int nodeId,
+                                                                       String metadataKey)
+                throws VoldemortException {
+            Versioned<String> value = metadataMgmtOps.getRemoteMetadata(nodeId,
+                                                                        metadataKey);
+            List<StoreDefinition> storeList = storeMapper.readStoreList(new StringReader(value.getValue()),
+                                                                        false);
+            return new Versioned<List<StoreDefinition>>(storeList, value.getVersion());
+        }
 
         /**
          * Retrieve the store definitions from a remote node.
@@ -1647,19 +1792,64 @@ public class AdminClient implements Closeable {
          */
         public Versioned<List<StoreDefinition>> getRemoteStoreDefList(int nodeId)
                 throws VoldemortException {
-            Versioned<String> value = metadataMgmtOps.getRemoteMetadata(nodeId,
-                                                                        MetadataStore.STORES_KEY);
-            List<StoreDefinition> storeList = storeMapper.readStoreList(new StringReader(value.getValue()),
-                                                                        false);
-            return new Versioned<List<StoreDefinition>>(storeList, value.getVersion());
+            return getRemoteStoreDefList(nodeId, MetadataStore.STORES_KEY);
         }
 
         public Versioned<List<StoreDefinition>> getRemoteStoreDefList() throws VoldemortException {
-            Integer nodeId = AdminClient.this.getAdminClientCluster()
-                                             .getNodeIds()
-                                             .iterator()
-                                             .next();
+            Integer nodeId = currentCluster.getNodeIds().iterator().next();
             return getRemoteStoreDefList(nodeId);
+        }
+
+        /**
+         * Retrieve a store from a random node in the cluster.
+         * Note that, store may present on some nodes and not on other
+         * nodes, due to node failures or other reasons. In those cases
+         * results will be inconsistent based on the node it choose to query.
+         *
+         * @param storeName name of the store
+         * @return null if it does not exist, StoreDefinition if it exists.
+         */
+        public StoreDefinition getStoreDefinition(String storeName) {
+            Integer nodeId = currentCluster.getNodeIds().iterator().next();
+            return getStoreDefinition(nodeId, storeName);
+        }
+
+        /**
+         * Retrieve the storeDefinition from a particular node.
+         * 
+         * @param nodeId node to retrieve the store from
+         * @param storeName name of the store.
+         * @return null if it does not exist, StoreDefinition if it exists.
+         */
+        public StoreDefinition getStoreDefinition(int nodeId, String storeName) {
+            if (storeName == null || storeName.length() == 0) {
+                throw new IllegalArgumentException("storeName");
+            }
+
+            String storeKey = fetchSingleStore ? storeName : MetadataStore.STORES_KEY;
+
+            Versioned<List<StoreDefinition>> storeDef;
+            try {
+                storeDef = getRemoteStoreDefList(nodeId, storeKey);
+            } catch (StoreNotFoundException ex) {
+                logger.info("Store " + storeName + " is not found in node " + nodeId + " key used " + storeKey);
+                return null;
+            }
+
+            if (storeDef == null || storeDef.getValue() == null) {
+                logger.warn("Unexpected null returned from getRemoteStoreDefList " + storeDef);
+                return null;
+            }
+
+            List<StoreDefinition> retrievedStoreDefs = storeDef.getValue();
+            for (StoreDefinition retrievedStoreDef : retrievedStoreDefs) {
+                if (retrievedStoreDef.getName().equals(storeName)) {
+                    return retrievedStoreDef;
+                }
+            }
+            logger.info("Store " + storeName + " is not found in node " + nodeId + " Total Store"
+                    + retrievedStoreDefs.size() + " key used " + storeKey);
+            return null;
         }
 
         /**
@@ -1783,34 +1973,53 @@ public class AdminClient implements Closeable {
          * @param nodeId Node on which to add the store
          */
         public void addStore(StoreDefinition def, int nodeId) {
-            addStore(def, Lists.newArrayList(nodeId));
-        }
-
-        public void addStore(StoreDefinition def, Collection<Integer> nodeIds) {
-            // Check for backwards compatibility
             StoreDefinitionUtils.validateSchemasAsNeeded(Arrays.asList(def));
 
             String value = storeMapper.writeStore(def);
-            VAdminProto.AddStoreRequest.Builder addStoreRequest = VAdminProto.AddStoreRequest.newBuilder()
-                                                                                             .setStoreDefinition(value);
-            VAdminProto.VoldemortAdminRequest request = VAdminProto.VoldemortAdminRequest.newBuilder()
-                                                                                         .setType(VAdminProto.AdminRequestType.ADD_STORE)
-                                                                                         .setAddStore(addStoreRequest)
-                                                                                         .build();
-            for(Integer nodeId: nodeIds) {
-                Node node = currentCluster.getNodeById(nodeId);
-                if(null == node) {
-                    throw new VoldemortException("Invalid node id (" + nodeId + ") specified");
-                }
+            VAdminProto.AddStoreRequest.Builder addStoreRequest =
+                    VAdminProto.AddStoreRequest.newBuilder().setStoreDefinition(value);
+            VAdminProto.VoldemortAdminRequest request =
+                    VAdminProto.VoldemortAdminRequest.newBuilder().setType(VAdminProto.AdminRequestType.ADD_STORE)
+                            .setAddStore(addStoreRequest)
 
-                logger.info("Adding store " + def.getName() + " on " + node.briefToString());
-                VAdminProto.AddStoreResponse.Builder response = rpcOps.sendAndReceive(nodeId,
-                                                                                      request,
-                                                                                      VAdminProto.AddStoreResponse.newBuilder());
-                if(response.hasError()) {
-                    helperOps.throwException(response.getError());
-                }
-                logger.info("Successfully added " + def.getName() + " on " + node.briefToString());
+                            .build();
+
+            Node node = currentCluster.getNodeById(nodeId);
+            if (null == node) {
+                throw new VoldemortException("Invalid node id (" + nodeId + ") specified");
+            }
+
+            logger.info("Adding store " + def.getName() + " on " + node.briefToString());
+            VAdminProto.AddStoreResponse.Builder response =
+                    rpcOps.sendAndReceive(nodeId, request, VAdminProto.AddStoreResponse.newBuilder());
+            if (response.hasError()) {
+                helperOps.throwException(response.getError());
+            }
+            logger.info("Successfully added " + def.getName() + " on " + node.briefToString());
+        }
+
+        public void addStore(StoreDefinition def, Collection<Integer> nodeIds) {
+            for(Integer nodeId: nodeIds) {
+                addStore(def, nodeId);
+            }
+        }
+
+        class NodeStoreRetriever implements Runnable {
+            final int nodeId;
+            final String key;
+            final ConcurrentMap<Integer, List<StoreDefinition>> results;
+
+            public NodeStoreRetriever(int nodeId, String key, ConcurrentMap<Integer, List<StoreDefinition>> results) {
+                this.nodeId = nodeId;
+                this.key = key;
+                this.results = results;
+            }
+
+            @Override
+            public void run() {
+                List<StoreDefinition> retrievedStoreDefs =
+                        metadataMgmtOps.getRemoteStoreDefList(nodeId, key).getValue();
+                results.put(nodeId, retrievedStoreDefs);
             }
         }
 
@@ -1829,6 +2038,223 @@ public class AdminClient implements Closeable {
                 return false;
             }
             return Objects.equal(oldDef.getCompression(), newDef.getCompression());
+        }
+
+        private StoreDefinition getNewStoreWithRemoteSerializer(StoreDefinition remoteStoreDef,
+                StoreDefinition newStoreDef) {
+            StoreDefinition newStoreDefWithRemoteSerializer =
+                    new StoreDefinition(
+                            newStoreDef.getName(),
+                            newStoreDef.getType(),
+                            newStoreDef.getDescription(),
+                            remoteStoreDef.getKeySerializer(), // Remote Key SerDe
+                            remoteStoreDef.getValueSerializer(), // Remote Value SerDe
+                            newStoreDef.getTransformsSerializer(), newStoreDef.getRoutingPolicy(),
+                            newStoreDef.getRoutingStrategyType(), newStoreDef.getReplicationFactor(),
+                            newStoreDef.getPreferredReads(), newStoreDef.getRequiredReads(),
+                            newStoreDef.getPreferredWrites(), newStoreDef.getRequiredWrites(),
+                            newStoreDef.getViewTargetStoreName(), newStoreDef.getValueTransformation(),
+                            newStoreDef.getZoneReplicationFactor(), newStoreDef.getZoneCountReads(),
+                            newStoreDef.getZoneCountWrites(), newStoreDef.getRetentionDays(),
+                            newStoreDef.getRetentionScanThrottleRate(), newStoreDef.getRetentionFrequencyDays(),
+                            newStoreDef.getSerializerFactory(), newStoreDef.getHintedHandoffStrategyType(),
+                            newStoreDef.getHintPrefListSize(), newStoreDef.getOwners(),
+                            newStoreDef.getMemoryFootprintMB());
+
+            return newStoreDefWithRemoteSerializer;
+        }
+
+        private void validateSerializerDefs(StoreDefinition remoteStoreDef, StoreDefinition newStoreDef, Node node,
+                String localProcessName) {
+            SerializerDefinition newKeySerializerDef = newStoreDef.getKeySerializer();
+            SerializerDefinition newValueSerializerDef = newStoreDef.getValueSerializer();
+            SerializerDefinition remoteKeySerializerDef = remoteStoreDef.getKeySerializer();
+            SerializerDefinition remoteValueSerializerDef = remoteStoreDef.getValueSerializer();
+            String newValSerDeName = newValueSerializerDef.getName();
+
+            if(seriailizerMetadataEquals(remoteKeySerializerDef,newKeySerializerDef)
+               && seriailizerMetadataEquals(remoteValueSerializerDef,newValueSerializerDef)) {
+                Object remoteKeyDef, remoteValDef, localKeyDef, localValDef;
+                if (newValSerDeName.equals(DefaultSerializerFactory.AVRO_GENERIC_VERSIONED_TYPE_NAME) ||
+                        newValSerDeName.equals(DefaultSerializerFactory.AVRO_GENERIC_TYPE_NAME)) {
+                    remoteKeyDef = Schema.parse(remoteKeySerializerDef.getCurrentSchemaInfo());
+                    remoteValDef = Schema.parse(remoteValueSerializerDef.getCurrentSchemaInfo());
+                    localKeyDef = Schema.parse(newKeySerializerDef.getCurrentSchemaInfo());
+                    localValDef = Schema.parse(newValueSerializerDef.getCurrentSchemaInfo());
+                } else if (newValSerDeName.equals(DefaultSerializerFactory.JSON_SERIALIZER_TYPE_NAME)) {
+                    remoteKeyDef = JsonTypeDefinition.fromJson(remoteKeySerializerDef.getCurrentSchemaInfo());
+                    remoteValDef = JsonTypeDefinition.fromJson(remoteValueSerializerDef.getCurrentSchemaInfo());
+                    localKeyDef = JsonTypeDefinition.fromJson(newKeySerializerDef.getCurrentSchemaInfo());
+                    localValDef = JsonTypeDefinition.fromJson(newValueSerializerDef.getCurrentSchemaInfo());
+                } else {
+                    throw new VoldemortException("verifyOrAddStore() only works with Avro Generic and JSON serialized stores!");
+                }
+                boolean serializerDefinitionsAreEqual = remoteKeyDef.equals(localKeyDef) && remoteValDef.equals(localValDef);
+                
+                if (serializerDefinitionsAreEqual) {
+                    StoreDefinition newStoreDefWithRemoteSerializer =
+                            getNewStoreWithRemoteSerializer(remoteStoreDef, newStoreDef);
+                    if (remoteStoreDef.equals(newStoreDefWithRemoteSerializer)) {
+                        // The difference is in one of the ignorable fields like owner, description
+                        return;
+                    } else {
+                        // if we still get a fail, then we know that the store defs don't match for reasons
+                        // OTHER than the key/value serializer
+                        String errorMessage = "Your store schema is identical, " +
+                                "but the store definition does not match on " + node.briefToString();
+                        logger.error(errorMessage + diffMessage(newStoreDefWithRemoteSerializer, remoteStoreDef, localProcessName));
+                        throw new VoldemortException(errorMessage);
+                    }
+                } else {
+                    String errorMessage = "Your store definition does not match the store definition that is " +
+                            "already defined on " + node.briefToString();
+                    logger.error(errorMessage + diffMessage(newStoreDef, remoteStoreDef, localProcessName));
+                    throw new VoldemortException(errorMessage);
+                }
+            } else {
+                String errorMessage =
+                        "Your store definition does not match the store definition that is " + "already defined on "
+                                + node.briefToString();
+                logger.error(errorMessage + diffMessage(newStoreDef, remoteStoreDef, localProcessName));
+                throw new VoldemortException(errorMessage);
+            }
+        }
+
+        /**
+         * validate the newStoreDefinition is compatible with existing
+         * storeDefinition. If they are incompatible, it throws an error.
+         *
+         * @param remoteStoreDef Store retrieved from the remote node
+         * @param newStoreDef Store that needs to be created
+         */
+        private void validateStoreDefinition(StoreDefinition remoteStoreDef, StoreDefinition newStoreDef, Node node,
+                String localProcessName) {
+            if (remoteStoreDef == null || newStoreDef == null || node == null) {
+                throw new IllegalArgumentException(" one of the input parameters is null");
+            }
+
+            String storeName = remoteStoreDef.getName();
+            if (!storeName.equals(newStoreDef.getName())) {
+                throw new IllegalArgumentException(" Remote Store " + storeName + " New Store " + newStoreDef.getName());
+            }
+
+            if (remoteStoreDef.equals(newStoreDef)) {
+                // Remote Store and Current store is exact match, no need to add the store.
+                return;
+            }
+
+            validateSerializerDefs(remoteStoreDef, newStoreDef, node, localProcessName);
+        }
+
+        private List<StoreDefinition> getFutureResult(int nodeId, Map<Integer, Future> nodeTasks,
+                ConcurrentMap<Integer, List<StoreDefinition>> nodeStores) {
+            validateTaskCompleted(nodeId, nodeTasks);
+            List<StoreDefinition> storeDefs = nodeStores.get(nodeId);
+            if (storeDefs == null) {
+                throw new VoldemortException("No error in future, but empty stores returned, unexpected");
+            }
+            return storeDefs;
+        }
+        
+        // unreachableNodes gets passed in as empty list, unreachable nodes are added to that list.
+        private List<Integer> getNodesMissingNewStore(StoreDefinition newStoreDef, String localProcessName,
+                ExecutorService executor, List<Node> unreachableNodes) {
+            List<Integer> nodesMissingNewStore = Lists.newArrayList();
+
+            ConcurrentMap<Integer, List<StoreDefinition>> nodeStores =
+                    new ConcurrentHashMap<Integer, List<StoreDefinition>>();
+
+            Map<Integer, Future> nodeTasks = new HashMap<Integer, Future>();
+
+            // Get all StoreDefinitions or just the particular store, depending on the preference
+            String storeKey = fetchSingleStore ? newStoreDef.getName() : MetadataStore.STORES_KEY;
+
+            if (executor != null) {
+                for (Node node : currentCluster.getNodes()) {
+                    int nodeId = node.getId();
+                    NodeStoreRetriever task = new NodeStoreRetriever(nodeId, storeKey, nodeStores);
+                    Future future = executor.submit(task);
+                    nodeTasks.put(nodeId, future);
+                }
+            }
+
+            for (Node node : currentCluster.getNodes()) {
+                int nodeId = node.getId();
+                List<StoreDefinition> retrievedStoreDefs;
+                try {
+                    if (executor == null) {
+                        retrievedStoreDefs = metadataMgmtOps.getRemoteStoreDefList(nodeId, storeKey).getValue();
+                    } else {
+                        retrievedStoreDefs = getFutureResult(nodeId, nodeTasks, nodeStores);
+                    }
+                } catch (StoreNotFoundException ex) {
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("Store does not exist " + node.briefToString() + " message " + ex.getMessage());
+                    }
+                    // No store could be found, assume empty store definition
+                    retrievedStoreDefs = Lists.newArrayList();
+                } catch (VoldemortException e) {
+
+                    // getRemoteStoreDefList() internally results in a socket pool checkout which can throw
+                    // SocketException and possibly other subclasses of IOException, so we check for IOException
+                    // to catch all of these cases...
+                    if (ExceptionUtils.recursiveClassEquals(e, UnreachableStoreException.class, IOException.class)) {
+                        logger.warn("Failed to contact " + node.briefToString() + " in order to validate the StoreDefinition.");
+                        unreachableNodes.add(node);
+                        continue;
+                    } else {
+                        throw e;
+                    }
+                }
+
+                StoreDefinition remoteStoreDef = null;
+                for (StoreDefinition retrievedStoreDef : retrievedStoreDefs) {
+                    if (retrievedStoreDef.getName().equals(newStoreDef.getName())) {
+                        remoteStoreDef = retrievedStoreDef;
+                        break;
+                    }
+                }
+
+                if (remoteStoreDef == null) {
+                    nodesMissingNewStore.add(nodeId);
+                } else {
+                    validateStoreDefinition(remoteStoreDef, newStoreDef, node, localProcessName);
+                }
+            }
+
+            return nodesMissingNewStore;
+        }
+        
+        private void addStoresViaExecutorService(final StoreDefinition newStoreDef, List<Integer> nodesMissingNewStore,
+                ExecutorService executor) {
+            if (executor == null) {
+                throw new IllegalArgumentException("executor is null");
+            }
+
+            Map<Integer, Future> nodeTasks = new HashMap<Integer, Future>();
+            for (final Integer nodeId : nodesMissingNewStore) {
+                Future future = executor.submit(new Runnable() {
+                    @Override
+                    public void run() {
+                        storeMgmtOps.addStore(newStoreDef, nodeId);
+                    }
+                });
+                nodeTasks.put(nodeId, future);
+            }
+            
+            RuntimeException lastEx = null;
+            for(final Integer nodeId : nodesMissingNewStore) {
+                try {
+                    validateTaskCompleted(nodeId, nodeTasks);
+                } catch (RuntimeException ex) {
+                    // wait for all addStores to complete, throw the last one.
+                    lastEx = ex;
+                }
+            }
+
+            if (lastEx != null) {
+                throw lastEx;
+            }
         }
 
         /**
@@ -1854,147 +2280,45 @@ public class AdminClient implements Closeable {
          * @param newStoreDef StoreDefinition to make sure exists on all online Voldemort Servers
          * @param localProcessName Name of the process interested in creating the store
          *                         (for example: Build and Push), used for debugging purposes.
-         * @param createStore whether or not add new store if sotres are not found in the cluster.
+         * @param createStore whether or not add new store if stores are not found in the cluster.
          * @throws UnreachableStoreException Thrown if one or more server was unreachable. Can
          *                                   potentially be ignored, in certain use cases.
          * @throws VoldemortException Thrown if a server contains an incompatible StoreDefinitions.
          */
-        public void verifyOrAddStore(StoreDefinition newStoreDef, String localProcessName, boolean createStore)
-                throws UnreachableStoreException, VoldemortException {
+        public void verifyOrAddStore(StoreDefinition newStoreDef, String localProcessName, boolean createStore,
+                ExecutorService executor) throws UnreachableStoreException, VoldemortException {
             if (!newStoreDef.getType().equals(ReadOnlyStorageConfiguration.TYPE_NAME)) {
                 throw new VoldemortException("verifyOrAddStore() is intended only for Read-Only stores!");
             }
 
-            List<Integer> nodesMissingNewStore = Lists.newArrayList();
+            long startTime = System.currentTimeMillis();
             List<Node> unreachableNodes = Lists.newArrayList();
-            for (Node node: currentCluster.getNodes()) {
-                boolean addStoreToCurrentNode = true;
-                int nodeId = node.getId();
-                List<StoreDefinition> remoteStoreDefs = Lists.newArrayList();
+            List<Integer> nodesMissingNewStore =
+                    getNodesMissingNewStore(newStoreDef, localProcessName, executor, unreachableNodes);
 
-                try {
-                    // Get all StoreDefinitions from each nodes in the cluster
-                    remoteStoreDefs = metadataMgmtOps.getRemoteStoreDefList(nodeId).getValue();
-                } catch (UnreachableStoreException e) {
-                    logger.warn("Failed to contact " + node.briefToString() + " in order to validate the StoreDefinition.");
-                    unreachableNodes.add(node);
-                    continue;
+            long verifyCompletionTime = System.currentTimeMillis();
+            long elapsedTime = verifyCompletionTime - startTime;
+            String timingInfo = "verifyOrAddStore() " + AdminClient.this.debugInfo + " Store: "
+                                + newStoreDef.getName() + " Verification Time: " + elapsedTime
+                                + " ms";
+
+            if(!nodesMissingNewStore.isEmpty()) {
+                if(!createStore) {
+                    throw new VoldemortException("Store: " + newStoreDef.getName()
+                                                 + " is not found in the current cluster.");
+                }
+                if (executor == null) {
+                    storeMgmtOps.addStore(newStoreDef, nodesMissingNewStore);
+                } else {
+                    addStoresViaExecutorService(newStoreDef, nodesMissingNewStore, executor);
                 }
 
-                // Go over all StoreDefinitions and see if one has the same name as the store we're trying to build
-                for(StoreDefinition remoteStoreDef: remoteStoreDefs) {
-                    if(remoteStoreDef.getName().equals(newStoreDef.getName())) {
-                        if(remoteStoreDef.equals(newStoreDef)) {
-                            // A match made in heaven
-                            addStoreToCurrentNode = false;
-                        } else {
-                            // if the store already exists, but doesn't equal() what we want to push, we need to worry
-
-                            // let's check to see if the key/value serializers are REALLY equal.
-                            SerializerDefinition newKeySerializerDef = newStoreDef.getKeySerializer();
-                            SerializerDefinition newValueSerializerDef = newStoreDef.getValueSerializer();
-                            SerializerDefinition remoteKeySerializerDef = remoteStoreDef.getKeySerializer();
-                            SerializerDefinition remoteValueSerializerDef = remoteStoreDef.getValueSerializer();
-                            String newValSerDeName = newValueSerializerDef.getName();
-
-                            if(seriailizerMetadataEquals(remoteKeySerializerDef,newKeySerializerDef)
-                               && seriailizerMetadataEquals(remoteValueSerializerDef,newValueSerializerDef)) {
-
-                                Object remoteKeyDef, remoteValDef, localKeyDef, localValDef;
-                                if (newValSerDeName.equals(DefaultSerializerFactory.AVRO_GENERIC_VERSIONED_TYPE_NAME) ||
-                                        newValSerDeName.equals(DefaultSerializerFactory.AVRO_GENERIC_TYPE_NAME)) {
-                                    remoteKeyDef = Schema.parse(remoteKeySerializerDef.getCurrentSchemaInfo());
-                                    remoteValDef = Schema.parse(remoteValueSerializerDef.getCurrentSchemaInfo());
-                                    localKeyDef = Schema.parse(newKeySerializerDef.getCurrentSchemaInfo());
-                                    localValDef = Schema.parse(newValueSerializerDef.getCurrentSchemaInfo());
-                                } else if (newValSerDeName.equals(DefaultSerializerFactory.JSON_SERIALIZER_TYPE_NAME)) {
-                                    remoteKeyDef = JsonTypeDefinition.fromJson(remoteKeySerializerDef.getCurrentSchemaInfo());
-                                    remoteValDef = JsonTypeDefinition.fromJson(remoteValueSerializerDef.getCurrentSchemaInfo());
-                                    localKeyDef = JsonTypeDefinition.fromJson(newKeySerializerDef.getCurrentSchemaInfo());
-                                    localValDef = JsonTypeDefinition.fromJson(newValueSerializerDef.getCurrentSchemaInfo());
-                                } else {
-                                    throw new VoldemortException("verifyOrAddStore() only works with Avro Generic and JSON serialized stores!");
-                                }
-                                boolean serializerDefinitionsAreEqual = remoteKeyDef.equals(localKeyDef) && remoteValDef.equals(localValDef);
-
-                                if (serializerDefinitionsAreEqual) {
-                                    // If current schemas are equal, then we'll try to ignore that part and compare the rest.
-                                    StoreDefinition newStoreDefWithRemoteSerializer = new StoreDefinition(newStoreDef.getName(),
-                                                                                                          newStoreDef.getType(),
-                                                                                                          newStoreDef.getDescription(),
-                                                                                                          remoteKeySerializerDef, // Remote Key SerDe
-                                                                                                          remoteValueSerializerDef, // Remote Value SerDe
-                                                                                                          newStoreDef.getTransformsSerializer(),
-                                                                                                          newStoreDef.getRoutingPolicy(),
-                                                                                                          newStoreDef.getRoutingStrategyType(),
-                                                                                                          newStoreDef.getReplicationFactor(),
-                                                                                                          newStoreDef.getPreferredReads(),
-                                                                                                          newStoreDef.getRequiredReads(),
-                                                                                                          newStoreDef.getPreferredWrites(),
-                                                                                                          newStoreDef.getRequiredWrites(),
-                                                                                                          newStoreDef.getViewTargetStoreName(),
-                                                                                                          newStoreDef.getValueTransformation(),
-                                                                                                          newStoreDef.getZoneReplicationFactor(),
-                                                                                                          newStoreDef.getZoneCountReads(),
-                                                                                                          newStoreDef.getZoneCountWrites(),
-                                                                                                          newStoreDef.getRetentionDays(),
-                                                                                                          newStoreDef.getRetentionScanThrottleRate(),
-                                                                                                          newStoreDef.getRetentionFrequencyDays(),
-                                                                                                          newStoreDef.getSerializerFactory(),
-                                                                                                          newStoreDef.getHintedHandoffStrategyType(),
-                                                                                                          newStoreDef.getHintPrefListSize(),
-                                                                                                          newStoreDef.getOwners(),
-                                                                                                          newStoreDef.getMemoryFootprintMB());
-
-                                    if (remoteStoreDef.equals(newStoreDefWithRemoteSerializer)) {
-                                        // All good after all (for this node) !
-                                        addStoreToCurrentNode = false;
-                                    } else {
-                                        // if we still get a fail, then we know that the store defs don't match for reasons
-                                        // OTHER than the key/value serializer
-                                        String errorMessage = "Your store schema is identical, " +
-                                                "but the store definition does not match on " + node.briefToString();
-                                        logger.error(errorMessage + diffMessage(newStoreDefWithRemoteSerializer, remoteStoreDef, localProcessName));
-                                        throw new VoldemortException(errorMessage);
-                                    }
-                                } else {
-                                    // if the key/value serializers are not equal (even in java, not just json strings),
-                                    // then fail
-                                    String errorMessage = "Your data schema does not match the schema which is already " +
-                                            "defined on " + node.briefToString();
-                                    logger.error(errorMessage + diffMessage(newStoreDef, remoteStoreDef, localProcessName));
-                                    throw new VoldemortException(errorMessage);
-                                }
-                            } else {
-                                String errorMessage = "Your store definition does not match the store definition that is " +
-                                        "already defined on " + node.briefToString();
-                                logger.error(errorMessage + diffMessage(newStoreDef, remoteStoreDef, localProcessName));
-                                throw new VoldemortException(errorMessage);
-                            }
-                        }
-                        if (!addStoreToCurrentNode) {
-                            // No need to iterate over the rest of the StoreDefinitions returned by the node...
-                            break;
-                        } else {
-                            // The above code has a bit of a complex flow... so this is just in case future code changes
-                            // introduce an issue that might otherwise make the store verification fail silently.
-                            throw new VoldemortException("Unexpected code path! At this point, we should either have found " +
-                                                                 "a matching store or already thrown another exception. " +
-                                                                 "Current remoteStoreDef: '" + remoteStoreDef.getName() + "'. " +
-                                                                 "Current node: " + node.briefToString());
-                        }
-                    }
-                }
-
-                if (addStoreToCurrentNode) {
-                    nodesMissingNewStore.add(nodeId);
-                }
+                long createCompletionTime = System.currentTimeMillis();
+                elapsedTime = createCompletionTime - verifyCompletionTime;
+                timingInfo += ", Creation Time: " + elapsedTime + " ms";
             }
 
-            if (!createStore && !nodesMissingNewStore.isEmpty())
-                throw new VoldemortException("Store: " + newStoreDef.getName() + " is not found in the current cluster.");
-
-            storeMgmtOps.addStore(newStoreDef, nodesMissingNewStore);
+            logger.info(timingInfo);
 
             if (unreachableNodes.size() > 0) {
                 String errorMessage = "verifyOrAddStore() failed against the following nodes: ";
@@ -2011,8 +2335,16 @@ public class AdminClient implements Closeable {
             }
         }
 
+        public void verifyOrAddStore(StoreDefinition newStoreDef, String localProcessName, boolean createStore) {
+            verifyOrAddStore(newStoreDef, localProcessName, createStore, null);
+        }
+
         public void verifyOrAddStore(StoreDefinition newStoreDef, String localProcessName) {
-            verifyOrAddStore(newStoreDef, localProcessName, true);
+            verifyOrAddStore(newStoreDef, localProcessName, true, null);
+        }
+
+        public void verifyOrAddStore(StoreDefinition newStoreDef, String localProcessName, ExecutorService service) {
+            verifyOrAddStore(newStoreDef, localProcessName, true, service);
         }
 
         private String diffMessage(StoreDefinition newStoreDef, StoreDefinition remoteStoreDef, String localProcessName) {
@@ -2041,7 +2373,7 @@ public class AdminClient implements Closeable {
 
         /**
          * Delete a store from a particular node
-         * 
+         *
          * @param storeName name of the store to delete
          * @param nodeId Node on which we want to delete a store
          * @throws VoldemortException if it fails to delete
@@ -3036,6 +3368,22 @@ public class AdminClient implements Closeable {
         }
 
         /**
+         * Fetch values for given keys on a specific store present on a specific node.
+         * 
+         * @param storeName Name of the Store
+         * @param nodeId Id of the node to query from
+         * @param keys List of keys to be required.
+         * @return
+         * Only keys that has values will be returned in a Map.
+         * Keys that does not exists will not be present in the Map.
+         */
+        public Map<ByteArray, List<Versioned<byte[]>>> getAllNodeKeys(String storeName, int nodeId,
+                Iterable<ByteArray> keys) {
+            SocketStore socketStore = adminStoreClient.getSocketStore(nodeId, storeName);
+            return socketStore.getAll(keys, null);
+        }
+
+        /**
          * Delete a given key
          * 
          * @param storeName
@@ -3053,8 +3401,6 @@ public class AdminClient implements Closeable {
             }
             return result;
         }
-
-        // As needed, add 'getall', and so on interfaces...
     }
 
     /**
@@ -3076,16 +3422,16 @@ public class AdminClient implements Closeable {
          * waiting for a response from the server.</li>
          * <li>After iteration is complete, send an end of stream message, force
          * a flush of the buffer, check the response on the server to check if a
-         * {@link VoldemortException} has occured.</li>
+         * {@link VoldemortException} has occurred.</li>
          * </ol>
-         * 
+         *
          * @param nodeId Id of the remote node (where we wish to update the
          *        entries)
          * @param storeName Store name for the entries
          * @param entryIterator Iterator of key-value pairs for the entries
          * @param filter Custom filter implementation to filter out entries
          *        which should not be updated.
-         * 
+         *
          * @throws VoldemortException
          */
         public void updateEntries(int nodeId,
@@ -3131,9 +3477,9 @@ public class AdminClient implements Closeable {
          * waiting for a response from the server.</li>
          * <li>After iteration is complete, send an end of stream message, force
          * a flush of the buffer, check the response on the server to check if a
-         * {@link VoldemortException} has occured.</li>
+         * {@link VoldemortException} has occurred.</li>
          * </ol>
-         * 
+         *
          * @param nodeId Id of the remote node (where we wish to update the
          *        entries)
          * @param storeName Store name for the entries
@@ -3703,14 +4049,14 @@ public class AdminClient implements Closeable {
          *
          * @param cluster The cluster metadata
          * @param nodeId Do not check this node, we don't trust it right now.
-	 *		May be -1 to check every node.
+         *               May be -1 to check every node.
          * @return List of store definitions
          */
         public List<StoreDefinition> getCurrentStoreDefinitionsExcept(Cluster cluster, int nodeId) {
             List<StoreDefinition> storeDefs = null;
             for(Node node: cluster.getNodes()) {
-		if (node.getId() == nodeId)
-		    continue;
+                if (node.getId() == nodeId)
+                    continue;
                 List<StoreDefinition> storeDefList = metadataMgmtOps.getRemoteStoreDefList(node.getId())
                                                                     .getValue();
                 if(storeDefs == null) {
@@ -3741,8 +4087,8 @@ public class AdminClient implements Closeable {
          * @return List of store definitions
          */
         public List<StoreDefinition> getCurrentStoreDefinitions(Cluster cluster) {
-	    return getCurrentStoreDefinitionsExcept(cluster, -1);
-	}
+            return getCurrentStoreDefinitionsExcept(cluster, -1);
+        }
 
         /**
          * Given a list of store definitions, cluster and admin client returns a
@@ -3790,7 +4136,7 @@ public class AdminClient implements Closeable {
 
     /**
      * Encapsulates all operations to restore data in the cluster
-     * 
+     *
      */
     public class RestoreOperations {
 
@@ -4120,7 +4466,24 @@ public class AdminClient implements Closeable {
             }
 
             int asyncId = response.getRequestId();
-            return rpcOps.waitForCompletion(nodeId, asyncId, timeoutMs, TimeUnit.MILLISECONDS);
+            try {
+                return rpcOps.waitForCompletion(nodeId, asyncId, timeoutMs, TimeUnit.MILLISECONDS);
+            } catch (AsyncOperationTimeoutException aote) {
+                logger.error("Got an AsyncOperationTimeoutException for nodeId " + nodeId + " while waiting for"
+                             + " completion of Async Operation ID " + asyncId + ". Will attempt to kill the job"
+                             + " and rethrow the original exception afterwards.");
+                try {
+                    rpcOps.stopAsyncRequest(nodeId, asyncId);
+                    logger.info("Successfully killed Async Operation ID " + asyncId);
+                } catch (Exception e) {
+                    logger.error("Failed to kill Async Operation ID " + asyncId, e);
+                }
+                throw aote;
+            } catch (VoldemortException ve) {
+                logger.error("Got a " + ve.getClass().getSimpleName() + " for nodeId " + nodeId + " while waiting for"
+                             + " completion of Async Operation ID " + asyncId + ". Bubbling up.");
+                throw ve;
+            }
         }
 
         /**
@@ -4742,91 +5105,184 @@ public class AdminClient implements Closeable {
         }
     }
 
+    private static void validateTaskCompleted(int nodeId, Map<Integer, Future> nodeTasks) {
+        try {
+            nodeTasks.get(nodeId).get();
+        } catch (ExecutionException ex) {
+            Throwable t = ex.getCause();
+            if (t instanceof VoldemortException) {
+                throw (VoldemortException) t;
+            } else {
+                throw new RuntimeException("Unexpected exception from Future", t);
+            }
+        } catch (InterruptedException ex) {
+            throw new VoldemortException("Future task is interrupted for Node" + nodeId, ex);
+        }
+    }
+
     public class QuotaManagementOperations {
 
-        public void setQuota(String storeName, String quotaTypeStr, String quotaValue) {
-            QuotaType quotaType = null;
-            try {
-                quotaType = QuotaType.valueOf(quotaTypeStr);
-            } catch (IllegalArgumentException e) {
-                throw new VoldemortException("'" + quotaTypeStr + "' is not a supported quota type. " +
-                        "The following types are supported: " + Lists.newArrayList(QuotaType.values()), e);
+        private VectorClock makeDenseClock() {
+          // FIXME This is a temporary workaround for System store client not
+          // being able to do a second insert. We simply generate a super
+          // clock that will trump what is on storage
+          // But this will not work, if the nodes are ever removed or re-assigned.
+          // To complicate the issue further, SystemStore uses one clock for all
+          // keys in a file. When you remove nodes, go delete, all version files from the disk
+          // otherwise
+          return VectorClockUtils.makeClockWithCurrentTime(currentCluster.getNodeIds());
+        }
+
+        public void setQuota(final String storeName, final QuotaType quotaType, final long quota,
+                ExecutorService executor) {
+            
+            Map<Integer, Future> nodeTasks = new HashMap<Integer, Future>();
+
+            if(executor != null) {
+                for (final Integer id : currentCluster.getNodeIds()) {
+                    Runnable task = new Runnable() {
+                        @Override
+                        public void run() {
+                            setQuotaForNode(storeName, quotaType, id, quota);
+                        }
+                    };
+                    Future future = executor.submit(task);
+                    nodeTasks.put(id, future);
+                }
             }
-            // FIXME This is a temporary workaround for System store client not
-            // being able to do a second insert. We simply generate a super
-            // clock that will trump what is on storage
-            VectorClock denseClock = VectorClockUtils.makeClockWithCurrentTime(currentCluster.getNodeIds());
-            String quotaKey = QuotaUtils.makeQuotaKey(storeName, quotaType);
-            quotaSysStoreClient.putSysStore(quotaKey, new Versioned<String>(quotaValue, denseClock));
-            logger.info("Set quota " + quotaTypeStr + " to " + quotaValue + " for store "
-                        + storeName);
+
+            RuntimeException lastEx = null;
+            List<Integer> failedNodes = new ArrayList<Integer>();
+            for (Integer nodeId : currentCluster.getNodeIds()) {
+                try {
+                    if (executor == null) {
+                        setQuotaForNode(storeName, quotaType, nodeId, quota);
+                    } else {
+                        validateTaskCompleted(nodeId, nodeTasks);
+                    }
+                } catch(RuntimeException ex) {
+                    lastEx = ex;
+                    failedNodes.add(nodeId);
+                    logger.info("Setting Quota on Store " + storeName + " Type " + quotaType
+                                + " value " + quota + " failed. Reason " + ex.getMessage());
+                }
+            }
+
+            if(lastEx != null) {
+                logger.info("Setting Quota failed on Nodes "
+                            + Arrays.toString(failedNodes.toArray()));
+                throw lastEx;
+            }
         }
 
-        public void unsetQuota(String storeName, String quotaType) {
-            quotaSysStoreClient.deleteSysStore(QuotaUtils.makeQuotaKey(storeName,
-                                                                       QuotaType.valueOf(quotaType)));
-            logger.info("Unset quota " + quotaType + " for store " + storeName);
+        public void setQuota(String storeName, QuotaType quotaType, long quota) {
+            setQuota(storeName, quotaType, quota, null);
         }
 
-        public Versioned<String> getQuota(String storeName, String quotaType) {
-            return quotaSysStoreClient.getSysStore(QuotaUtils.makeQuotaKey(storeName,
-                                                                           QuotaType.valueOf(quotaType)));
+        public void unsetQuota(String storeName, QuotaType quotaType) {
+            RuntimeException lastEx = null;
+
+            for (Integer nodeId : currentCluster.getNodeIds()) {
+                try {
+                    deleteQuotaForNode(storeName, quotaType, nodeId);
+                } catch (RuntimeException ex) {
+                    lastEx = ex;
+                    logger.info("Deleting Quota on Store " + storeName + " Type " + quotaType + "failed", ex);
+                }
+            }
+
+            if (lastEx != null) {
+                throw lastEx;
+            }
+        }
+
+        public Versioned<String> getQuota(String storeName, QuotaType quotaType) {
+            return getQuotaForNode(storeName, quotaType, currentCluster.getNodeIds().iterator().next());
+        }
+
+        public Map<String, Versioned<String>> getQuota(List<String> storeNames, QuotaType quotaType) {
+            return getQuotaForNode(storeNames, quotaType, currentCluster.getNodeIds().iterator().next());
         }
 
         public void setQuotaForNode(String storeName, QuotaType quotaType, Integer nodeId, Long quota) {
-            try {
-                String quotaKey = QuotaUtils.makeQuotaKey(storeName, quotaType);
-                ByteArray keyArray = new ByteArray(quotaKey.getBytes("UTF8"));
-                VectorClock clock = VectorClockUtils.makeClockWithCurrentTime(currentCluster.getNodeIds());
-                NodeValue<ByteArray, byte[]> nodeKeyValue = new NodeValue<ByteArray, byte[]>(nodeId,
-                                                                                             keyArray,
-                                                                                             new Versioned<byte[]>(ByteUtils.getBytes(quota.toString(),
-                                                                                                                                      "UTF8"),
-                                                                                                                   clock));
-                storeOps.deleteNodeKeyValue(SystemStoreConstants.SystemStoreName.voldsys$_store_quotas.name(),
-                                            nodeId,
-                                            keyArray);
-                storeOps.putNodeKeyValue(SystemStoreConstants.SystemStoreName.voldsys$_store_quotas.name(),
-                                         nodeKeyValue);
-            } catch(UnsupportedEncodingException e) {
-                throw new VoldemortException(e);
-            }
+            ByteArray keyArray = QuotaUtils.getByteArrayKey(storeName, quotaType);
+            VectorClock clock = makeDenseClock();
+            byte[] valueArray = ByteUtils.getBytes(quota.toString(), "UTF8");
+            Versioned<byte[]> value = new Versioned<byte[]>(valueArray, clock);
+
+            NodeValue<ByteArray, byte[]> nodeKeyValue = new NodeValue<ByteArray, byte[]>(nodeId,
+                                                                                         keyArray,
+                                                                                         value);
+            storeOps.putNodeKeyValue(SystemStoreConstants.SystemStoreName.voldsys$_store_quotas.name(),
+                                     nodeKeyValue);
         }
         
         public boolean deleteQuotaForNode(String storeName, QuotaType quotaType, Integer nodeId) {
-            try {
-                String quotaKey = QuotaUtils.makeQuotaKey(storeName, quotaType);
-
-                ByteArray keyArray = new ByteArray(quotaKey.getBytes("UTF8"));
-                return storeOps.deleteNodeKeyValue(SystemStoreConstants.SystemStoreName.voldsys$_store_quotas.name(),
+            ByteArray keyArray = QuotaUtils.getByteArrayKey(storeName, quotaType);
+            return storeOps.deleteNodeKeyValue(SystemStoreConstants.SystemStoreName.voldsys$_store_quotas.name(),
                                                    nodeId,
                                                    keyArray);
-            } catch(UnsupportedEncodingException e) {
-                throw new VoldemortException(e);
+        }
+
+        private Versioned<String> convertToString(List<Versioned<byte[]>> retrievedValue) {
+            if (retrievedValue == null || retrievedValue.size() == 0) {
+                return null;
+            }
+
+            if (retrievedValue.size() > 1) {
+                throw new VoldemortApplicationException("More than one value present for same quota "
+                        + Arrays.toString(retrievedValue.toArray()));
+            }
+
+            try {
+                String quotaValue = new String(retrievedValue.get(0).getValue(), "UTF8");
+                Version version = retrievedValue.get(0).getVersion();
+                return new Versioned<String>(quotaValue, version);
+            } catch (UnsupportedEncodingException ex) {
+                throw new VoldemortApplicationException("Error converting quota value to String", ex);
             }
         }
 
         public Versioned<String> getQuotaForNode(String storeName,
                                                  QuotaType quotaType,
                                                  Integer nodeId) {
-            try {
-                String quotaKey = QuotaUtils.makeQuotaKey(storeName, quotaType);
-                
-                ByteArray keyArray = new ByteArray(quotaKey.getBytes("UTF8"));
-                List<Versioned<byte[]>> valueObj = storeOps.getNodeKey(SystemStoreConstants.SystemStoreName.voldsys$_store_quotas.name(),
-                                                                       nodeId,
-                                                                       keyArray);
-    
-                if(valueObj.size() == 0) {
-                    return null;
-                }
-    
-                String quotaValue = new String(valueObj.get(0).getValue(), "UTF8");
-                Version version = valueObj.get(0).getVersion();
-                return new Versioned<String>(quotaValue, version);
-            } catch(UnsupportedEncodingException e) {
-                throw new VoldemortException(e);
+            ByteArray keyArray = QuotaUtils.getByteArrayKey(storeName, quotaType);
+            List<Versioned<byte[]>> valueObj =
+                    storeOps.getNodeKey(SystemStoreConstants.SystemStoreName.voldsys$_store_quotas.name(), nodeId,
+                            keyArray);
+
+            return convertToString(valueObj);
+        }
+
+        public Map<String, Versioned<String>> getQuotaForNode(List<String> storeNames, QuotaType quotaType,
+                Integer nodeId) {
+            if (storeNames == null || storeNames.size() == 0) {
+                throw new IllegalArgumentException("Storenames is a required parameter");
             }
+
+            Map<String, ByteArray> storeToKeysMap = new HashMap<String, ByteArray>();
+            for (String storeName : storeNames) {
+                ByteArray key = QuotaUtils.getByteArrayKey(storeName, quotaType);
+                storeToKeysMap.put(storeName, key);
+            }
+            
+            Map<ByteArray, List<Versioned<byte[]>>> storeToValueMap =
+                    storeOps.getAllNodeKeys(SystemStoreConstants.SystemStoreName.voldsys$_store_quotas.name(), nodeId,
+                    storeToKeysMap.values());
+
+            Map<String, Versioned<String>> results = new HashMap<String, Versioned<String>>();
+
+            for (Map.Entry<String, ByteArray> storeToKey : storeToKeysMap.entrySet()) {
+                String storeName = storeToKey.getKey();
+                ByteArray storeKey = storeToKey.getValue();
+                
+                Versioned<String> storeQuota = null;
+                if (storeToValueMap.containsKey(storeKey)) {
+                    storeQuota = convertToString(storeToValueMap.get(storeKey));
+                }
+                results.put(storeName, storeQuota);
+            }
+            return results;
         }
 
         /**
@@ -4852,11 +5308,11 @@ public class AdminClient implements Closeable {
                 logger.info("No quota set for " + quotaType.toString() + " of store " + storeName
                             + " ");
             } else {
-                Integer averageQuota = totalQuota / nodeIds.size();
+                long averageQuota = totalQuota / nodeIds.size();
                 logger.info("Resetting quota: Store: " + storeName + ", Quota: "
                             + quotaType.toString() + ", Total: " + totalQuota.toString()
-                            + ", Average: " + averageQuota.toString());
-                setQuota(storeName, quotaType.toString(), averageQuota.toString());
+                            + ", Average: " + averageQuota);
+                setQuota(storeName, quotaType, averageQuota);
             }
         }
         

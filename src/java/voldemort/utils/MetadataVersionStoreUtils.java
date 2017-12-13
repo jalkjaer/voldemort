@@ -17,6 +17,8 @@
 package voldemort.utils;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.util.List;
 import java.util.Properties;
 
@@ -70,6 +72,20 @@ public class MetadataVersionStoreUtils {
         }
     }
 
+    public static Long getVersion(Properties prop, String versionKey) {
+        long value = 0;
+
+        if(prop != null && prop.getProperty(versionKey) != null) {
+            String strValue = prop.getProperty(versionKey);
+            value = tryParse(strValue);
+        }
+
+        if(logger.isDebugEnabled()) {
+            logger.debug("*********** For key : " + versionKey + " received value = " + value);
+        }
+        return value;
+    }
+
     public static Properties mergeVersions(Properties prop1, Properties prop2) {
         if(prop1 == null) {
             return prop2;
@@ -78,7 +94,12 @@ public class MetadataVersionStoreUtils {
             return prop1;
         }
 
-        Properties result = new Properties(prop1);
+        Properties result = new Properties();
+
+        for(String propName: prop1.stringPropertyNames()) {
+            result.setProperty(propName, prop1.getProperty(propName));
+        }
+
         for(String propName: prop2.stringPropertyNames()) {
             String currValue = result.getProperty(propName);
             long currlValue = tryParse(currValue);
@@ -134,6 +155,13 @@ public class MetadataVersionStoreUtils {
         return finalVersionList.toString();
     }
 
+    public static byte[] convertToByteArray(Properties props) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        props.store(out, null);
+        out.flush();
+        return out.toByteArray();
+    }
+
     /**
      * Writes the Properties object to the Version metadata system store
      * 
@@ -144,6 +172,7 @@ public class MetadataVersionStoreUtils {
     public static void setProperties(SystemStoreClient<String, String> versionStore,
                                      Versioned<Properties> props) {
         if(props == null || props.getValue() == null) {
+            logger.info("Ignoring set for empty properties");
             return;
         }
 
@@ -153,7 +182,7 @@ public class MetadataVersionStoreUtils {
                                                                       props.getVersion());
             versionStore.putSysStore(SystemStoreConstants.VERSIONS_METADATA_KEY, versionedString);
         } catch(Exception e) {
-            logger.debug("Got exception in setting properties : " + e.getMessage());
+            logger.info("Got exception in setting properties : ", e);
         }
     }
 
@@ -166,7 +195,8 @@ public class MetadataVersionStoreUtils {
      */
     public static void setProperties(SystemStoreClient<String, String> versionStore,
                                      Properties props) {
-        if(props == null) {
+        if (props == null) {
+            logger.info("Ignoring set for empty properties");
             return;
         }
 
@@ -175,7 +205,7 @@ public class MetadataVersionStoreUtils {
             versionStore.putSysStore(SystemStoreConstants.VERSIONS_METADATA_KEY,
                                      versionString);
         } catch(Exception e) {
-            logger.debug("Got exception in setting properties : " + e.getMessage());
+            logger.info("Got exception in setting properties : ", e);
         }
     }
 }

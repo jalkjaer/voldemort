@@ -169,7 +169,7 @@ public class AdminCommandQuota extends AbstractAdminCommand {
             OptionParser parser = getParser();
 
             // declare parameters
-            List<String> quotaTypes = null;
+            List<QuotaType> quotaTypes = null;
             List<String> storeNames = null;
             List<Integer> nodeIds = null;
             Boolean allNodes = null;
@@ -225,14 +225,14 @@ public class AdminCommandQuota extends AbstractAdminCommand {
          */
         public static void doQuotaGet(AdminClient adminClient,
                                       List<String> storeNames,
-                                      List<String> quotaTypes,
+                                      List<QuotaType> quotaTypes,
                                       List<Integer> nodeIds) {
             for(String storeName: storeNames) {
                 if(!adminClient.helperOps.checkStoreExistsInCluster(storeName)) {
                     System.out.println("Store " + storeName + " not in cluster.");
                 } else {
                     System.out.println("Store " + storeName);
-                    for(String quotaType: quotaTypes) {
+                    for(QuotaType quotaType: quotaTypes) {
                         Versioned<String> quotaVal = null;
                         if(nodeIds == null) {
                             quotaVal = adminClient.quotaMgmtOps.getQuota(storeName, quotaType);
@@ -246,7 +246,7 @@ public class AdminCommandQuota extends AbstractAdminCommand {
                             for(Integer nodeId: nodeIds) {
                                 quotaVal = null;
                                 quotaVal = adminClient.quotaMgmtOps.getQuotaForNode(storeName,
-                                                                                    QuotaType.valueOf(quotaType),
+                                                                                    quotaType,
                                                                                     nodeId);
 
                                 if(quotaVal == null) {
@@ -513,6 +513,7 @@ public class AdminCommandQuota extends AbstractAdminCommand {
             allNodes = options.has(AdminParserUtils.OPT_ALL_NODES);
             if(options.has(AdminParserUtils.OPT_NODE)) {
                 nodeIds = (List<Integer>) options.valuesOf(AdminParserUtils.OPT_NODE);
+                allNodes = false;
             }
             if(options.has(AdminParserUtils.OPT_CONFIRM)) {
                 confirm = true;
@@ -528,7 +529,11 @@ public class AdminCommandQuota extends AbstractAdminCommand {
             System.out.println("  " + Joiner.on(", ").join(storeNames));
             System.out.println("Location:");
             System.out.println("  bootstrap url = " + url);
-            System.out.println("  node = all nodes");
+            if (allNodes || nodeIds == null) {
+                System.out.println("  node = all nodes");
+            } else {
+                System.out.println("  node = " + Joiner.on(", ").join(nodeIds));
+            }
 
             // execute command
             if(!AdminToolUtils.askConfirm(confirm, "set quota")) {
@@ -566,8 +571,8 @@ public class AdminCommandQuota extends AbstractAdminCommand {
                         Map.Entry entry = (Map.Entry) iter.next();
                         if(nodeIds == null) {
                             adminClient.quotaMgmtOps.setQuota(storeName,
-                                                              (String) entry.getKey(),
-                                                              (String) entry.getValue());
+                                                              QuotaType.valueOf((String) entry.getKey()),
+                                                              Long.parseLong((String) entry.getValue()));
                         } else {
                             for(Integer nodeId: nodeIds) {
                                 adminClient.quotaMgmtOps.setQuotaForNode(storeName,
@@ -652,7 +657,7 @@ public class AdminCommandQuota extends AbstractAdminCommand {
             OptionParser parser = getParser();
 
             // declare parameters
-            List<String> quotaTypes = null;
+            List<QuotaType> quotaTypes = null;
             List<String> storeNames = null;
             String url = null;
             Boolean confirm = false;
@@ -715,10 +720,10 @@ public class AdminCommandQuota extends AbstractAdminCommand {
          */
         public static void doQuotaUnset(AdminClient adminClient,
                                         List<String> storeNames,
-                                        List<String> quotaTypes) {
+                                        List<QuotaType> quotaTypes) {
             for(String storeName: storeNames) {
                 if(adminClient.helperOps.checkStoreExistsInCluster(storeName)) {
-                    for(String quotaType: quotaTypes) {
+                    for(QuotaType quotaType: quotaTypes) {
                         adminClient.quotaMgmtOps.unsetQuota(storeName, quotaType);
                     }
                     System.out.println("Finished unsetting quota!");
